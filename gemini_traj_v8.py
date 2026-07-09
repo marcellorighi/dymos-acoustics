@@ -114,7 +114,7 @@ p = om.Problem()
 p.driver = om.pyOptSparseDriver(optimizer='IPOPT')
 p.driver.opt_settings['print_level'] = 5
 # p.driver.opt_settings['delta'] = 1e-1
-p.driver.opt_settings['max_iter'] = 620
+p.driver.opt_settings['max_iter'] = 20
 
 # Generate Obstacles
 avoid_points = [(random.uniform(50, 450), random.uniform(50, 400), 0) for _ in range(120)]

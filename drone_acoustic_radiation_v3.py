@@ -449,6 +449,70 @@ def generate_rotor_azimuth(rpm_fine: np.ndarray, t_fine: np.ndarray,
     p_rotor = p_peak * np.sin(phase + disturbance)
     return p_rotor, phase, disturbance
 
+def generate_rotor_azimuth_with_harmonics(rpm_fine: np.ndarray, t_fine: np.ndarray,
+                                          r: np.ndarray, theta_rad: np.ndarray,
+                                         acoustic_params: AcousticParams,
+                                         fine_params: FineGridParams = None, rng=None,
+                                         max_harmonics: int = 3, decay_exponent: float = 1.5):
+    """
+    Generate one rotor's synthetic acoustic pressure signal keeping higher 
+    harmonics into account using an empirical power-law amplitude decay.
+
+    Parameters
+    ----------
+    ... [same as original parameters] ...
+    max_harmonics : int, optional
+        The total number of harmonics to synthesize (default is 3: fundamental, 2nd, 3rd).
+    decay_exponent : float, optional
+        The power alpha controlling the amplitude decay rate 1 / (n^alpha). 
+        Typically ranges between 1.0 (slower decay) and 2.0 (faster decay).
+    """
+    if fine_params is None:
+        fine_params = FineGridParams()
+    if rng is None:
+        rng = np.random.default_rng(fine_params.random_seed)
+
+    rpm_fine = np.asarray(rpm_fine, dtype=float).ravel()
+
+    # 1. Compute the fundamental phase profile
+    if fine_params.use_integrated_phase:
+        phase = 2.0 * np.pi * cumulative_trapezoid(rpm_fine / 60.0, t_fine, initial=0.0)
+    else:
+        phase = 2.0 * np.pi * (rpm_fine / 60.0) * t_fine
+
+    # 2. Compute the phase jitter disturbance
+    disturbance = fine_params.disturbance_amplitude_rad * _band_limited_noise(
+        n_samples=t_fine.size, fs=fine_params.fs,
+        bandwidth_hz=fine_params.disturbance_bandwidth_hz, rng=rng,
+    )
+
+    # 3. Get the baseline fundamental peak pressure amplitude from total radiated power
+    p_acoustic = acoustic_power_per_rotor(rpm_fine, acoustic_params)
+    p_peak_fundamental = power_to_pressure_amplitude(p_acoustic, r, theta_rad, acoustic_params)
+
+    # Optional: If your fundamental sound represents Blade Passage Frequency (BPF), 
+    # you can uncomment the line below or handle it externally:
+    # num_blades = 2
+    # phase = num_blades * phase
+
+    # 4. Synthesize the pressure wave using a Fourier Series combination
+    # Start with an empty array of zeros matching the fine time grid
+    p_rotor = np.zeros_like(t_fine, dtype=float)
+
+    for n in range(1, max_harmonics + 1):
+        # Calculate the amplitude decay for the n-th harmonic
+        # n=1 -> 1.0, n=2 -> 0.354, n=3 -> 0.192 (for exponent=1.5)
+        harmonic_scale = 1.0 / (n ** decay_exponent)
+
+        # Scale the peak pressure for this harmonic
+        p_peak_n = p_peak_fundamental * harmonic_scale
+
+        # The phase accelerates linearly with the harmonic order 'n'
+        # Note: The phase jitter (disturbance) scales with 'n' because phase errors 
+        # multiply proportionally in higher frequencies.
+        p_rotor += p_peak_n * np.sin(n * (phase + disturbance))
+
+    return p_rotor, phase, disturbance
 
 def estimate_received_spl_fine(t, x, y, z,
                                 rpm_front, rpm_rear, rpm_right, rpm_left,
@@ -549,7 +613,7 @@ def estimate_received_spl_fine(t, x, y, z,
     rng = np.random.default_rng(fine_params.random_seed)
     p_rotor, phase, disturbance = {}, {}, {}
     for name in rpm_fine:
-        p_rotor[name], phase[name], disturbance[name] = generate_rotor_azimuth(
+        p_rotor[name], phase[name], disturbance[name] = generate_rotor_azimuth_with_harmonics(
             rpm_fine[name], t_fine, r, theta, acoustic_params, fine_params, rng=rng
         )
 
