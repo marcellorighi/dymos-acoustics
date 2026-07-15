@@ -149,6 +149,7 @@ def observer_geometry(x, y, z, observer_xyz, z_up: bool = True):
     x, y, z = (np.asarray(v, dtype=float).ravel() for v in (x, y, z))
     x_obs, y_obs, z_obs = observer_xyz
 
+    # TEMP
     dx = x_obs - x
     dy = y_obs - y
     dz = z_obs - z
@@ -453,7 +454,7 @@ def generate_rotor_azimuth_with_harmonics(rpm_fine: np.ndarray, t_fine: np.ndarr
                                           r: np.ndarray, theta_rad: np.ndarray,
                                          acoustic_params: AcousticParams,
                                          fine_params: FineGridParams = None, rng=None,
-                                         max_harmonics: int = 3, decay_exponent: float = 1.5):
+                                         max_harmonics: int = 6, decay_exponent: float = 1.5):
     """
     Generate one rotor's synthetic acoustic pressure signal keeping higher 
     harmonics into account using an empirical power-law amplitude decay.
@@ -677,7 +678,7 @@ if __name__ == "__main__":
     # Calibrate p_ref against a plausible datasheet-style reference:
     # "62 dB at 1 m, in-plane (90 deg), all 4 rotors at 5000 RPM hover"
     p_ref = calibrate_p_ref(
-        spl_ref_db=82.0, # 62.0
+        spl_ref_db=62.0, # 62.0
         rpm_ref_measurement=5000.0,
         r_ref=1.0,
         theta_ref_deg=90.0,
@@ -687,7 +688,7 @@ if __name__ == "__main__":
     acoustic_params = AcousticParams(rpm_ref=5000.0, p_ref=p_ref, n_exponent=5.0)
 
     # Fixed ground observer, 50 m horizontally from the trajectory's start, at ground level
-    observer_xyz = (0.0, 50.0, 0.0)
+    observer_xyz = (2.0, 0.0, 0.0)
 
     spl_result = estimate_received_spl(
         t, x, y, z,

@@ -1,7 +1,7 @@
 import openmdao.api as om
 import numpy as np
-from drone_pid_function_v10 import evaluate_drone_codesign
-from drone_pid_function_v10 import plot_comprehensive_diagnostics
+from drone_pid_function_v11 import evaluate_drone_codesign
+from drone_pid_function_v11 import plot_comprehensive_diagnostics
 class DroneCoDesignComponent(om.ExplicitComponent):
     """
     Wraps your custom simulation into an OpenMDAO-compatible component,
@@ -31,12 +31,14 @@ class DroneCoDesignComponent(om.ExplicitComponent):
         self.declare_partials(of='*', wrt='*', method='fd', step=1e-4)
 
     def compute(self, inputs, outputs):
-        # Reconstruct the 10-dimensional design vector X for your function
+        # Reconstruct the 12-dimensional design vector X for your function
         X = [
             inputs['R_rotor'][0],
             inputs['L_arm'][0],
             inputs['v_max'][0],
             inputs['t_climb'][0],
+            inputs['vx_max'][0],
+            inputs['vy_max'][0],
             inputs['Kp_vel'][0],
             inputs['Ki_vel'][0],
             inputs['Kp_att'][0],
@@ -77,6 +79,8 @@ if __name__ == "__main__":
     model.add_design_var('L_arm',   lower=0.20, upper=0.60)
     model.add_design_var('v_max',   lower=2.0,  upper=10.0)
     model.add_design_var('t_climb', lower=1.0,  upper=5.0)
+    model.add_design_var('vx_max', lower=0.0, upper=8.0)
+    model.add_design_var('vy_max', lower=0.0, upper=0.0) # Locked to 0 for now
     
     # 4. Add Control Gain Design Variables with Custom Bounds
     model.add_design_var('Kp_vel',  lower=0.05, upper=0.25)
@@ -137,7 +141,7 @@ if __name__ == "__main__":
     
     # Run the wrapper one final time with debug=True using the optimal vector
     _, hist_state, time_steps, v_z_ref, pa = evaluate_drone_codesign(
-        X_opt, dt=0.01, t_total=4.0, debug=True
+        X_opt, dt=0.01, t_end=4.0, debug=True
     )
     
     # Call your comprehensive plotting dashboard function

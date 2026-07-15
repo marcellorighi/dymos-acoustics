@@ -27,6 +27,93 @@ arm_length = 0.25       # m
 t_ref = MASS * g /4     # N 
 rpm_ref = 5000.         # RPM 
 
+def compute_acoustic_spectrum_debug(spl_fine):
+    """
+    Computes the single-sided frequency spectrum (Narrowband SPL) 
+    of the combined acoustic pressure signal at the observer.
+    
+    Parameters
+    ----------
+    spl_fine : dict
+        The output dictionary from estimate_received_spl_fine()
+        containing 't_fine' and 'p_signal'.
+        
+    Returns
+    -------
+    dict with keys:
+        'frequencies' : 1D array of frequency bins [Hz]
+        'spl_frequency': 1D array of Sound Pressure Levels [dB SPL] per bin
+        'p_rms_fft'    : Raw RMS pressure amplitudes per frequency bin [Pa]
+    """
+    t_fine = np.asarray(spl_fine["t_fine"])
+    p_signal = np.asarray(spl_fine["p_signal"])
+    
+    # 1. Automatically calculate the sampling frequency (fs)
+    n_samples = len(t_fine)
+    duration = t_fine[-1] - t_fine[0]
+    fs = n_samples / duration  # [Hz]
+    
+    # 2. Apply a Hann window to prevent spectral leakage
+    window = np.hanning(n_samples)
+    windowed_signal = p_signal * window
+    
+    # Amplitude correction factor for applying the Hann window
+    window_loss_factor = np.sqrt(8.0 / 3.0) 
+    
+    # 3. Compute the Real Fast Fourier Transform (RFFT)
+    # Using rfft because physical pressure is a real-valued signal
+    p_fft = np.fft.rfft(windowed_signal)
+    frequencies = np.fft.rfftfreq(n_samples, d=1.0/fs)
+    
+    # 4. Convert to RMS pressure per frequency bin
+    # Scale by 2/N for single-sided spectrum, and adjust for windowing loss
+    p_amplitude = (2.0 / n_samples) * np.abs(p_fft) * window_loss_factor
+    p_rms = p_amplitude / np.sqrt(2.0)  # Convert peak to RMS
+    
+    # 5. Convert physical pressure (Pa) to Sound Pressure Level (dB SPL)
+    p_ref = 2e-5  # Auditory reference threshold [Pa]
+    # Use np.maximum to prevent log10(0.0) errors
+    spl_frequency = 20.0 * np.log10(np.maximum(p_rms, 1e-10) / p_ref)
+    
+    return {
+        "frequencies": frequencies,
+        "spl_frequency": spl_frequency,
+        "p_rms_fft": p_rms,
+        "fs": fs
+    }
+
+def plot_acoustic_spectrum(spectrum_data, max_freq_display=1000.0):
+    """
+    Plots the narrowband SPL spectrum up to a user-defined frequency limit.
+    """
+    freqs = spectrum_data["frequencies"]
+    spl_db = spectrum_data["spl_frequency"]
+    
+    # Filter arrays for cleaner plotting (we don't need to see up to fs/2)
+    mask = freqs <= max_freq_display
+    
+    plt.figure(figsize=(10, 4))
+    plt.plot(freqs[mask], spl_db[mask], color='#2980B9', linewidth=1.5, label='Synthetic Signal')
+    
+    plt.title('Narrowband Acoustic Frequency Spectrum at Observer (Debug Mode)', fontsize=12, fontweight='bold')
+    plt.xlabel('Frequency [Hz]', fontsize=10)
+    plt.ylabel('Sound Pressure Level [dB SPL]', fontsize=10)
+    plt.grid(True, which="both", linestyle=':', alpha=0.5)
+    plt.xlim(0, max_freq_display)
+    
+    # Find and label the absolute loudest peak (likely the dominant BPF)
+    peak_idx = np.argmax(spl_db[mask])
+    peak_freq = freqs[mask][peak_idx]
+    peak_val = spl_db[mask][peak_idx]
+    
+    plt.annotate(f'Dominant Tone: {peak_freq:.1f} Hz ({peak_val:.1f} dB)',
+                 xy=(peak_freq, peak_val),
+                 xytext=(peak_freq + (max_freq_display * 0.05), peak_val - 5),
+                 arrowprops=dict(facecolor='black', shrink=0.05, width=1, headwidth=6))
+    
+    plt.tight_layout()
+    plt.show()
+
 def compute_rotor_rpm_from_controls(time_steps, history_controls, arm_length, 
                                     t_ref, rpm_ref, rpm_min=1000.0, rpm_max=8000.0) -> dict:
     """
@@ -62,10 +149,15 @@ def compute_rotor_rpm_from_controls(time_steps, history_controls, arm_length,
     thrust_avg = F_z / 4.0
     
     # Differential thrust allocations mapping moments through the lever arm length L
-    F_front = thrust_avg + M_y / (2.0 * arm_length)
-    F_rear  = thrust_avg - M_y / (2.0 * arm_length)
-    F_right = thrust_avg + M_x / (2.0 * arm_length)
-    F_left  = thrust_avg - M_x / (2.0 * arm_length)
+    # F_front = thrust_avg + M_y / (2.0 * arm_length)
+    # F_rear  = thrust_avg - M_y / (2.0 * arm_length)
+    # F_right = thrust_avg + M_x / (2.0 * arm_length)
+    # F_left  = thrust_avg - M_x / (2.0 * arm_length)
+
+    F_front = thrust_avg + M_y / (1.0 * arm_length)
+    F_rear  = thrust_avg - M_y / (1.0 * arm_length)
+    F_right = thrust_avg + M_x / (1.0 * arm_length)
+    F_left  = thrust_avg - M_x / (1.0 * arm_length)
     
     # Prevent negative values physically (rotors cannot pull backward)
     F_front = np.clip(F_front, 0.0, None)
@@ -230,7 +322,7 @@ class DronePIDController:
         controls = np.array([0.0, 0.0, F_z, M_x, M_y, M_z])
         return controls, theta_cmd, phi_cmd
 
-def drone_derivatives_with_turb(t, state, controls, dryden_ts):
+def drone_derivatives_with_turb(t, state, controls, dryden_ts, aero_params=None):
     """
     6-DoF Drone Equations of Motion with injected Dryden Turbulence.
     """
@@ -264,7 +356,37 @@ def drone_derivatives_with_turb(t, state, controls, dryden_ts):
     R_body_to_inertial = R_z @ R_y @ R_x
     
     # Total controlled forces expressed in the body frame
-    total_force_body = np.array([F_x, F_y, F_z])
+    vel_inertial = state[3:6]
+    vel_body = R_body_to_inertial.T @ vel_inertial  # [u, v, w] of drone
+    
+    # Subtract wind gust vectors to find true airspeed components
+    u_air = vel_body[0] - wu
+    v_air = vel_body[1] - wv
+    w_air = vel_body[2] - ww
+
+    vmag_air = np.sqrt(u_air**2 + v_air**2 + w_air**2)
+    
+    # Multipliers scaled by a drag constant and the drone's current arm size!
+    # Pushes drag up if the drone or its structural arms expand
+    L_arm = 0.30 # TEMP
+    drag_coeff_planar   = 0.1 * (1.0 + L_arm) 
+    drag_coeff_vertical = 0.25 * (1.0 + L_arm)
+    
+    # Standard quadratic drag force: F = -C * V * |V|
+    # F_drag_x = -drag_coeff_planar * u_air * np.abs(u_air)
+    # F_drag_y = -drag_coeff_planar * v_air * np.abs(v_air)
+    # F_drag_z = -drag_coeff_vertical * w_air * np.abs(w_air)
+    
+    F_drag_x = -drag_coeff_planar * u_air * vmag_air
+    F_drag_y = -drag_coeff_planar * v_air * vmag_air
+    F_drag_z = -drag_coeff_vertical * w_air * vmag_air
+
+    delta_F_body = np.array([F_drag_x, F_drag_y, F_drag_z])
+    
+    # Add directly into total_force_body!
+    total_force_body = np.array([F_x, F_y, F_z]) + delta_F_body
+
+    # total_force_body = np.array([F_x, F_y, F_z])
     total_force_inertial = R_body_to_inertial @ total_force_body + gravity_force
     accel = total_force_inertial / MASS
     
@@ -328,7 +450,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     
     # 2. Reset / Pre-allocate matrices
     state = np.zeros(12)
-    state[2] = 5.0  # Start at 5m hover altitude
+    state[2] = 0.0  # Start at 5m hover altitude???
     target_yaw = 0.0
     
     history_state = np.zeros((len(time_steps), 12))
@@ -363,15 +485,6 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         history_gusts[idx, 3] = np.interp(t, t_ts, dryden_ts['p_turb'])
         history_gusts[idx, 4] = np.interp(t, t_ts, dryden_ts['q_turb'])
 
-    # 4. Acoustic Pipeline Processing
-    # Estimate Coarse RPMs
-    # rpm_result = estimate_rotor_rpm(
-    #     t=time_steps, x=history_state[:, 0], y=history_state[:, 1], z=history_state[:, 2],
-    #     vx=history_state[:, 3], vy=history_state[:, 4], vz=history_state[:, 5],
-    #     ax=history_accel[:, 0], ay=history_accel[:, 1], az=history_accel[:, 2],
-    #     wx=history_gusts[:, 0], wy=history_gusts[:, 1], wz=history_gusts[:, 2]
-    # )
-
     rpm_result = compute_rotor_rpm_from_controls(time_steps, history_controls, arm_length, 
                                     t_ref, rpm_ref, rpm_min=1000.0, rpm_max=8000.0)
     
@@ -388,7 +501,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         disturbance_amplitude_rad=0.05, disturbance_bandwidth_hz=20.0, random_seed=42,
     )
 
-    observer_xyz = (20.0, 0.0, 0.0)
+    observer_xyz = (5.0, 0.0, 0.0)
 
     # Compute Received SPL
     spl_fine = estimate_received_spl_fine(
@@ -406,86 +519,36 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     # Return metrics you want to evaluate or optimize (e.g. mean SPL or max SPL)
     return spl_fine, pa, rpm_result, history_state, history_controls, history_accel, history_gusts
 
-def generate_dynamic_trajectory(v_max: float, t_climb: float, dt: float = 0.01, t_total: float = 4.0):
+def generate_dynamic_trajectory(vx_max: float, vy_max: float, v_max: float, t_climb: float, dt: float = 0.01, t_total: float = 4.0):
     time_steps = np.arange(0.0, t_total + dt/2, dt)
     
-    # 1. FIX THE WAYPOINTS: Explicitly command a 0.0 m/s hover at t_climb
-    # We add a tiny buffer (dt) right before t_climb if your simulator needs a duration window,
-    # or simply declare that at t_climb, the target velocity vector is completely zero.
+    # 1. WAYPOINTS: Fully 3D Climb + Lateral Translation, then transition to pure level cruise
     velocity_schedule_waypoints = [
-        (0.0,     np.array([0.0, 0.0, float(v_max)])),  # Climb phase
-        (t_climb, np.array([0.0, 0.0, 0.0]))            # Brake & Hover phase
+        # Phase 1: Full 3D Diagonal Climb (moving along X, Y, and Z simultaneously)
+        (0.0,     np.array([float(vx_max), float(vy_max), float(v_max)])),  
+        # Phase 2: Level Planar Cruise (Z velocity drops to 0, holding X and Y speeds)
+        (t_climb, np.array([float(vx_max), float(vy_max), 0.0]))            
     ]
     
-    # 2. FIX THE 1D REFERENCE ARRAY: Make sure it mirrors the drop to 0.0
+    # 2. MATCHING REFERENCE ARRAYS FOR ALL THREE AXES
+    v_x_reference_array = np.zeros_like(time_steps, dtype=float)
+    v_y_reference_array = np.zeros_like(time_steps, dtype=float)
     v_z_reference_array = np.zeros_like(time_steps, dtype=float)
+    
     for i, t in enumerate(time_steps):
-        if t < t_climb:
-            v_z_reference_array[i] = v_max  # Active climbing
-        else:
-            v_z_reference_array[i] = 0.0    # Hard drop to hover target
-            
-    return velocity_schedule_waypoints, time_steps, v_z_reference_array
-
-# def generate_dynamic_trajectory(v_max: float, t_climb: float, dt: float = 0.01, t_total: float = 4.0):
-#     time_steps = np.arange(0.0, t_total + dt/2, dt)
-    
-#     # 1. The waypoint list format (What the SIMULATOR core needs)
-#     velocity_schedule_waypoints = [
-#         (0.0,     np.array([0.0, 0.0, float(v_max)])),
-#         (t_climb, np.array([0.0, 0.0, 0.0]))
-#     ]
-    
-#     # 2. A clean flat array of the Z-velocities over time (What the ERROR CHECKER needs)
-#     v_z_reference_array = np.zeros_like(time_steps, dtype=float)
-#     for i, t in enumerate(time_steps):
-#         if t < t_climb:
-#             v_z_reference_array[i] = (v_max / 2.0) * (1.0 - np.cos(np.pi * t / t_climb))
-#         else:
-#             v_z_reference_array[i] = v_max
-            
-#     return velocity_schedule_waypoints, time_steps, v_z_reference_array
-
-# def generate_dynamic_trajectory(v_max: float, t_climb: float, dt: float = 0.01, t_total: float = 4.0):
-#     """
-#     Generates a smooth, time-varying target velocity profile for the drone using
-#     a cosine-accelerated transition ramp.
-    
-#     Parameters:
-#     -----------
-#     v_max : float
-#         The maximum target tracking velocity reached during the maneuver [m/s].
-#     t_climb : float
-#         The duration of the active acceleration/climb phase [s]. Must be <= t_total.
-#     dt : float, optional
-#         The simulation time step [s]. Default is 0.01.
-#     t_total : float, optional
-#         The total flight duration for the evaluation window [s]. Default is 4.0.
+        # Planar velocities are maintained across the entire flight profile
+        v_x_reference_array[i] = vx_max  
+        v_y_reference_array[i] = vy_max  
         
-#     Returns:
-#     --------
-#     velocity_schedule : np.ndarray
-#         Array of target velocities corresponding to each step in time_steps.
-#     time_steps : np.ndarray
-#         The uniform time grid of the flight simulation.
-#     """
-#     # 1. Establish the clean master time grid
-#     time_steps = np.arange(0.0, t_total + dt/2, dt)
-    
-#     # Initialize an array of zeros matching the time grid size
-#     velocity_schedule = np.zeros_like(time_steps, dtype=float)
-    
-#     # 2. Build the smooth trajectory profile across time
-#     for i, t in enumerate(time_steps):
-#         if t < t_climb:
-#             # Cosine acceleration ramp: smoothly transitions from 0.0 to v_max
-#             # Acceleration starts at 0, peaks in the middle, and tapers to 0 at t_climb.
-#             velocity_schedule[i] = (v_max / 2.0) * (1.0 - np.cos(np.pi * t / t_climb))
-#         else:
-#             # Steady-state phase: hold the maximum velocity for the rest of the run
-#             velocity_schedule[i] = v_max
+        # Vertical velocity cuts off cleanly at t_climb
+        if t < t_climb:
+            v_z_reference_array[i] = v_max
+        else:
+            v_z_reference_array[i] = 0.0
             
-#     return velocity_schedule, time_steps
+    # Return all three reference arrays for the physics loop and plotting tools
+    return velocity_schedule_waypoints, time_steps, v_x_reference_array, v_y_reference_array, v_z_reference_array
+
 
 def update_drone_geometry(R_rotor: float, L_arm: float, baseline_params: dict = None):
     """
@@ -538,129 +601,118 @@ def check_tracking_performance(hist_state, v_z_ref, max_allowable_error=6.0):
     max_error = np.max(np.abs(error_vector))
     return max_error > max_allowable_error
 
+def compute_combined_objective(hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, vx_max, vz_max, alpha=0.4, beta=0.2, p=2):
+    """
+    Computes the 3-way multi-objective optimization cost:
+    Acoustic Annoyance vs. Tracking Accuracy (ITAE) vs. Speed Aggressiveness.
+    """
+    # 1. Calculate Annoyance Dose
+    acoustic_time_grid = np.linspace(0, time_steps[-1], len(pa["annoyance_PA"]))
+    annoyance_dose = np.trapezoid(pa["annoyance_PA"], x=acoustic_time_grid)
+    
+    # 2. Calculate 3D Velocity ITAE (Safe length matching)
+    min_len = min(len(hist_state), len(time_steps))
+    t_weighted = time_steps[:min_len]
+    
+    err_x = np.abs(v_x_ref[:min_len] - hist_state[:min_len, 3])
+    err_y = np.abs(v_y_ref[:min_len] - hist_state[:min_len, 4])
+    err_z = np.abs(v_z_ref[:min_len] - hist_state[:min_len, 5])
+    
+    itae_value = np.trapezoid(t_weighted * (err_x + err_y + err_z), x=t_weighted)
+    
+    # 3. Calculate Speed Penalty (Direct Linear Inverse Barrier to coax SNOPT)
 
+    vx_ref = 10.
+    vz_ref = 5. 
+    epsilon = 0.1
+    speed_penalty = 1.0 / ((vx_max/vx_ref)**p + (vz_max/vz_ref)**p + epsilon)
+    
+    # 4. Scaling Factors (keeps metrics balanced in a similar order of magnitude)
+    pa_scale    = 0.025   
+    itae_scale  = 0.2   
+    speed_scale = 10.   
+    
+    # 5. Formulate Scaled Combined Cost
+    acoustic_part = (1.0 - alpha - beta) * (annoyance_dose * pa_scale)
+    itae_part     = alpha * (itae_value * itae_scale)
+    speed_part    = beta * (speed_penalty * speed_scale)
+    
+    combined_cost = acoustic_part + itae_part + speed_penalty
+    
+    return float(combined_cost), annoyance_dose, itae_value, speed_penalty 
 
-def evaluate_drone_codesign(X, dt, t_end, debug= False):
+def evaluate_drone_codesign(X, dt, t_end, debug=False):
     """
     The standardized callable interface for the optimizer.
-    
-    Parameters:
-    -----------
-    X : array-like of shape (n_variables,)
-        A flat array containing the current design point suggested by the optimizer.
-        Example order: [R_rotor, L_arm, v_max, t_climb, Kp_vel, Ki_vel, Kp_att, Kd_att, Kp_alt, Kd_alt]
-        
-    Returns:
-    --------
-    result : dict
-        A dictionary containing the objective value and constraint states.
     """
     # 1. UNPACK THE DESIGN VECTOR
-    # Map the incoming flat array back into the named variables your script expects
     R_rotor   = float(X[0])
     L_arm     = float(X[1])
-    v_max     = float(X[2])
+    vz_max     = float(X[2])   
     t_climb   = float(X[3])
-    
-    # Extract your 6 control gains
-    gains = [float(val) for val in X[4:10]]
+    vx_max    = float(X[4])   
+    vy_max    = float(X[5])   
+    gains     = [float(val) for val in X[6:12]]
 
-    # time_steps = np.arange(0, t_end, dt)
-    
+    # 2. GENERATE ENVIRONMENTAL WIND NOISE & TARGET TRAJECTORY
     t_dryden = np.arange(0, t_end + dt, dt)
-
-    waypoints, time_steps, v_z_ref = generate_dynamic_trajectory(v_max, t_climb, dt=dt, t_total=t_end)
-    
     dryden_ts = generate_dryden_time_series(
         t_dryden,
         params=DrydenParams(
-            V=5.0,          # mean airspeed [m/s] -- your best estimate
-            sigma_u=1.5,    # longitudinal intensity [m/s]
-            sigma_v=1.5,    # lateral
-            sigma_w=0.75,   # vertical
-            L_u=200.0,      # length scales [m]
-            L_v=200.0,
-            L_w=50.0,
-            arm_length=0.25,
-            v_ref=5.0,
-            z_ref=20.0,
+            V=5.0, sigma_u=1.5, sigma_v=1.5, sigma_w=0.75,
+            L_u=200.0, L_v=200.0, L_w=50.0,
+            arm_length=L_arm,  
+            v_ref=5.0, z_ref=20.0,
         ),
-        seed=42,            # fix for reproducibility; vary for ensemble runs
-        altitude=50.0,      # representative flight altitude
-        )
-
-    # Run simulation with the WAYPOINT list format
-    drone_params = update_drone_geometry(R_rotor, L_arm)
-    outputs = run_drone_acoustic_simulation(
-        gains, dryden_ts, waypoints, time_steps, dt=dt, plant_params=drone_params
+        seed=42,
+        altitude=50.0,
     )
-    spl_fine, pa, _, hist_state, _, _, _ = outputs
-    
-    # Check tracking using the flat REFERENCE ARRAY instead of the waypoint list
-    if check_tracking_performance(hist_state, v_z_ref):
-        if debug:
-            print("🛑 Failed tracking performance thresholds.")
-        return {"objective": 99.0, "feasible": False}
 
+    waypoints, time_steps, v_x_ref, v_y_ref, v_z_ref = generate_dynamic_trajectory(
+        vx_max, vy_max, vz_max, t_climb, dt=dt, t_total=t_end
+    )
     
+    drone_params = update_drone_geometry(R_rotor, L_arm)
+
     if debug:
-        # --- BYPASS MODE ---
-        # Runs raw without a try/except net. If it crashes, it hits your terminal immediately.
-        drone_params = update_drone_geometry(R_rotor, L_arm)
-        velocity_schedule, time_steps, v_z_ref = generate_dynamic_trajectory(v_max, t_climb, dt=dt, t_total=t_end)
-        
+        # --- BYPASS MODE (Runs raw without try/except net for easier bug hunting) ---
         outputs = run_drone_acoustic_simulation(
-            gains, dryden_ts, velocity_schedule, time_steps, dt=dt, plant_params=drone_params
+            gains, dryden_ts, waypoints, time_steps, dt=dt, plant_params=drone_params
         )
-        spl_fine, pa, _, hist_state, _, _, _ = outputs
+        spl_fine, pa, rpm_results, hist_state, _, _, _ = outputs
         
-        # Check tracking performance explicitly
-        if check_tracking_performance(hist_state, v_z_ref):
-            print("🛑 DEBUG INFO: Simulation ran, but failed the 'check_tracking_performance' error threshold!")
-            return {"objective": 99.0, "feasible": False}, None, None, None
-            
-        acoustic_time_grid = np.linspace(0, time_steps[-1], len(pa["annoyance_PA"]))
-        annoyance_dose = np.trapezoid(pa["annoyance_PA"], x=acoustic_time_grid)
-        result_dict = {"objective": float(annoyance_dose), "feasible": True}
-        return result_dict, hist_state, time_steps, v_z_ref, pa
-        # result_dict = {"objective": float(annoyance_dose), "feasible": True}
-        # return result_dict, hist_state, time_steps, v_z_ref
+        # Call separated objective engine (Weights matching optimizer config: alpha=0.4, beta=0.2)
+        cost, noise, itae, speed_penalty = compute_combined_objective(
+            hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, vx_max, vz_max, alpha=0.4, beta=0.2, p=1
+        )
+        
+        result_dict = {"objective": cost, "feasible": True}
+        return result_dict, hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, spl_fine
     
     else:
         # --- OPTIMIZER MODE ---
-        # Leave your existing try/except block here untouched for the actual optimization solver
         try:
-            # 1. Update geometry based on optimizer's current X choices
-            drone_params = update_drone_geometry(R_rotor, L_arm)
-            
-            # 2. Generate the trajectory matrices
-            waypoints, time_steps, v_z_ref = generate_dynamic_trajectory(v_max, t_climb, dt=dt, t_total=t_end)
-            
-            # 3. Run the physics engine
             outputs = run_drone_acoustic_simulation(
                 gains, dryden_ts, waypoints, time_steps, dt=dt, plant_params=drone_params
             )
             spl_fine, pa, _, hist_state, _, _, _ = outputs
             
-            # 4. Enforce the tracking safety constraint
+            # Enforce the tracking safety constraint during optimization
             if check_tracking_performance(hist_state, v_z_ref):
                 return {"objective": 99.0, "feasible": False}
                 
-            # 5. Integrate the acoustic annoyance profile using the correct key
-            acoustic_time_grid = np.linspace(0, time_steps[-1], len(pa["annoyance_PA"]))
-            annoyance_dose = np.trapezoid(pa["annoyance_PA"], x=acoustic_time_grid)
-
-            print(annoyance_dose)
+            # Call separated objective engine
+            cost, noise, itae, speed_penalty = compute_combined_objective(
+                hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, vx_max, vz_max, alpha=0.4, beta=0.2, p=1
+            )
             
-            # 6. Success! Return the real performance score
-            return {"objective": float(annoyance_dose), "feasible": True}
+            print(f"Cost: {cost:.4f} (Noise: {noise:.2f}, ITAE: {itae:.2f}, Speed: {speed_penalty:.2f}))")
+            return {"objective": cost, "feasible": True}
             
         except Exception as e:
-            # This forces Python to print the exact line and error message causing the crash
             import traceback
             print(f"\n💥 CRASH DETECTED: {e}")
             traceback.print_exc() 
-            
             return {"objective": 99.0, "feasible": False}
     
 def plot_codesign_debug_results(hist_state, time_steps, v_z_ref):
@@ -695,15 +747,16 @@ def plot_codesign_debug_results(hist_state, time_steps, v_z_ref):
     plt.tight_layout()
     plt.show()
 
-def plot_comprehensive_diagnostics(hist_state, time_steps, v_z_ref, pa):
+def plot_comprehensive_diagnostics(hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, 
+                                   gains=None, gain_bounds=None, rpm_history=None):
     """
-    Generates two independent diagnostic dashboards:
+    Generates four independent diagnostic dashboards:
     1. Flight Dynamics Panel (Kinematics & State Trajectories)
     2. Psychoacoustic Panel (All calculated sound metrics)
+    3. Actuator Effort Panel (Rotor RPMs over time)
+    4. Control Gain Space (Optimized gains vs. Upper/Lower search bounds)
     """
-    # ----------------------------------------------------
-    # DASHBOARD 1: FLIGHT DYNAMICS
-    # ----------------------------------------------------
+    # Slice limits for safe length matching
     actual_x   = hist_state[:, 0]
     actual_y   = hist_state[:, 1]
     actual_alt = hist_state[:, 2]
@@ -711,9 +764,10 @@ def plot_comprehensive_diagnostics(hist_state, time_steps, v_z_ref, pa):
     actual_vy  = hist_state[:, 4]
     actual_vz  = hist_state[:, 5]
     
+    # ----------------------------------------------------
+    # DASHBOARD 1: FLIGHT DYNAMICS
+    # ----------------------------------------------------
     fig1, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
-    
-    # Panel A: Vertical Velocity Tracking
     axs[0].plot(time_steps, v_z_ref, 'r--', linewidth=2, label='Target Vz')
     axs[0].plot(time_steps[:len(actual_vz)], actual_vz, 'b-', linewidth=2, label='Actual Vz')
     axs[0].set_ylabel('Velocity Z [m/s]')
@@ -721,28 +775,25 @@ def plot_comprehensive_diagnostics(hist_state, time_steps, v_z_ref, pa):
     axs[0].grid(True, linestyle=':', alpha=0.6)
     axs[0].legend(loc='upper right')
     
-    # Panel B: Lateral Velocities
+    axs[1].plot(time_steps, v_x_ref, 'm--', linewidth=1.5, alpha=0.8, label='Target Vx')
     axs[1].plot(time_steps[:len(actual_vx)], actual_vx, 'm-', label='Actual Vx')
     axs[1].plot(time_steps[:len(actual_vy)], actual_vy, 'c-', label='Actual Vy')
     axs[1].set_ylabel('Planar Speed [m/s]')
     axs[1].grid(True, linestyle=':', alpha=0.6)
     axs[1].legend(loc='upper right')
     
-    # Panel C: Altitude Path
     axs[2].plot(time_steps[:len(actual_x)], actual_x, 'b-', linewidth=2, label='Position (X)')
     axs[2].plot(time_steps[:len(actual_y)], actual_y, 'r-', linewidth=2, label='Position (Y)')
     axs[2].plot(time_steps[:len(actual_alt)], actual_alt, 'g-', linewidth=2, label='Altitude (Z)')
     axs[2].set_xlabel('Time [seconds]')
-    axs[2].set_ylabel('Altitude [meters]')
+    axs[2].set_ylabel('Position / Distance [meters]') 
     axs[2].grid(True, linestyle=':', alpha=0.6)
     axs[2].legend(loc='lower right')
-    
     plt.tight_layout()
 
     # ----------------------------------------------------
     # DASHBOARD 2: FULL PSYCHOACOUSTIC PROFILE
     # ----------------------------------------------------
-    # Filter out only the keys we care about and define clean display labels/colors
     acoustic_metadata = {
         'loudness_sone':     {'label': 'Loudness [Sone]',        'color': '#2980B9'},
         'sharpness_acum':    {'label': 'Sharpness [Acum]',       'color': '#8E44AD'},
@@ -750,55 +801,103 @@ def plot_comprehensive_diagnostics(hist_state, time_steps, v_z_ref, pa):
         'fluctuation_vacil': {'label': 'Fluctuation [Vacil]',    'color': '#F39C12'},
         'annoyance_PA':      {'label': 'Total Annoyance [PA]',   'color': '#D35400'}
     }
-    
-    # Filter dictionary to only include keys that actually exist in your pa object
     active_keys = [k for k in acoustic_metadata.keys() if k in pa]
     num_plots = len(active_keys)
     
-    # Generate a vertical stack of subplots dynamically matching your dictionary layout
     fig2, axs2 = plt.subplots(num_plots, 1, figsize=(10, 2.2 * num_plots), sharex=True)
-    
-    # Handle edge case where only 1 key exists so matplotlib doesn't throw an indexing error
-    if num_plots == 1:
-        axs2 = [axs2]
+    if num_plots == 1: axs2 = [axs2]
         
     for idx, key in enumerate(active_keys):
         signal = np.asarray(pa[key], dtype=float)
-        
-        # Build an independent time vector matching this metric's window array size
         t_acoustic = np.linspace(0, time_steps[-1], len(signal))
-        
-        # Handle Array Masking to bypass NaN values (specifically for fluctuation strings)
         is_valid = ~np.isnan(signal)
-        
         meta = acoustic_metadata[key]
         if np.any(is_valid):
-            # Plot only the coordinates where valid numbers exist
             axs2[idx].plot(t_acoustic[is_valid], signal[is_valid], color=meta['color'], linewidth=2, label=meta['label'])
         else:
-            # Placeholder display if an entire array is filled with NaNs/Nones
-            axs2[idx].text(0.5, 0.5, 'Metric Data Unavailable', transform=axs2[idx].transAxes, 
-                           ha='center', va='center', color='gray', fontstyle='italic')
-            
+            axs2[idx].text(0.5, 0.5, 'Metric Data Unavailable', transform=axs2[idx].transAxes, ha='center', va='center', color='gray', fontstyle='italic')
         axs2[idx].set_ylabel(meta['label'], fontsize=10, fontweight='bold')
         axs2[idx].grid(True, linestyle=':', alpha=0.5)
-        
     axs2[-1].set_xlabel('Time [seconds]', fontsize=11)
     fig2.suptitle('Complete Psychoacoustic Sound Footprint', fontsize=14, fontweight='bold', y=0.99)
-    
     plt.tight_layout()
+
+    # ----------------------------------------------------
+    # NEW DASHBOARD 3: ROTOR ACTUATOR EFFORT (RPMs)
+    # ----------------------------------------------------
+    if rpm_history is not None:
+        fig3, ax3 = plt.subplots(1, 1, figsize=(10, 4))
+        num_rotors = rpm_history.shape[1] if len(rpm_history.shape) > 1 else 1
+        
+        t_rpm = time_steps[:len(rpm_history)]
+        if num_rotors > 1:
+            for r in range(num_rotors):
+                ax3.plot(t_rpm, rpm_history[:, r], linewidth=1.5, alpha=0.8, label=f'Rotor {r+1}')
+        else:
+            ax3.plot(t_rpm, rpm_history, color='#2C3E50', linewidth=2, label='Rotor System')
+            
+        ax3.set_title('Actuator Motor Commands', fontsize=12, fontweight='bold')
+        ax3.set_xlabel('Time [seconds]')
+        ax3.set_ylabel('Rotor Velocity [RPM]')
+        ax3.grid(True, linestyle=':', alpha=0.6)
+        ax3.legend(loc='upper right')
+        plt.tight_layout()
+
+    # ----------------------------------------------------
+    # NEW DASHBOARD 4: CONTROL GAINS BOUNDARY CONSTRAINTS
+    # ----------------------------------------------------
+    if gains is not None and gain_bounds is not None:
+        fig4, ax4 = plt.subplots(1, 1, figsize=(10, 5))
+        gain_labels = ['Kp_vel', 'Ki_vel', 'Kp_att', 'Kd_att', 'Kp_alt', 'Kd_alt']
+        
+        # Unpack lower and upper boundary vectors for plotting bounds windows
+        low_bounds = [b[0] for b in gain_bounds]
+        upp_bounds = [b[1] for b in gain_bounds]
+        x_indices = np.arange(len(gains))
+        
+        # Plot boundary indicators using high-visibility markers
+        ax4.scatter(x_indices, low_bounds, color='#C0392B', marker='_', s=300, linewidth=3, label='Lower Limit')
+        ax4.scatter(x_indices, upp_bounds, color='#27AE60', marker='_', s=300, linewidth=3, label='Upper Limit')
+        
+        # Plot optimized design points as prominent filled dots
+        ax4.scatter(x_indices, gains, color='#2980B9', marker='o', s=100, zorder=3, label='Optimized Value')
+        
+        # Draw dotted connectors between boundaries so it looks like a clean variance chart
+        for i in range(len(gains)):
+            ax4.vlines(i, low_bounds[i], upp_bounds[i], colors='gray', linestyles=':', alpha=0.7)
+            # Add a visual flag if a gain is hugging a boundary edge closely
+            if np.isclose(gains[i], low_bounds[i], rtol=1e-2) or np.isclose(gains[i], upp_bounds[i], rtol=1e-2):
+                ax4.text(i, gains[i], ' [BOUNDED]', color='orange', fontsize=9, fontweight='bold', va='bottom', ha='center')
+
+        ax4.set_title('Optimized Controller Gains vs. Design Search Space Bounds', fontsize=12, fontweight='bold')
+        ax4.set_xticks(x_indices)
+        ax4.set_xticklabels(gain_labels, fontweight='bold')
+        ax4.set_ylabel('Gain Numeric Value')
+        ax4.set_yscale('log')  # Uses log scale since Kp_alt (20.0) vs Ki_vel (0.01) have massive step changes
+        ax4.grid(True, which="both", linestyle=':', alpha=0.4)
+        ax4.legend(loc='upper right')
+        plt.tight_layout()
+        
     plt.show()
 
 if __name__ == "__main__":
 
     dt = 0.01 
-    t_end = 4.01
+    t_end = 12.01
+    vz_max = 5.0 
+    vx_max = 5.00 
+    vy_max = 0. 
+    t_climb = 3.0
 
     # Define a test drone configuration (middle of the bounds)
-    test_X = [0.22, 0.25, 5.0, 3.0, 0.15, 0.04, 3.0, 0.5, 15.0, 7.0]
+    test_X = [0.22, 0.25,  vz_max, t_climb, vx_max, vy_max, 0.15, 0.04, 3.0, 0.5, 15.0, 7.0]
     
     # --- ADD THIS TEMPORARY PRINT BLOCK TO YOUR MAIN ---
-    velocity_schedule, time_steps, v_z_reference_array = generate_dynamic_trajectory(test_X[2], test_X[3], dt=dt, t_total=t_end)
+    outputs_traj = generate_dynamic_trajectory(
+        vx_max, vy_max, vx_max, t_climb, dt=dt, t_total=t_end
+    )
+    waypoints, time_steps, v_x_ref, v_y_ref, v_z_ref = outputs_traj
+    # velocity_schedule, time_steps, v_x_reference_array, v_z_reference_array = generate_dynamic_trajectory(vx_max, test_X[2], test_X[3], dt=dt, t_total=t_end)
 
     print("--- TRAJECTORY ARRAY DIAGNOSIS ---")
     print(f"Shape of time_steps:        {time_steps.shape}")
@@ -808,8 +907,18 @@ if __name__ == "__main__":
     print("---------------------------------")
 
     print("Testing the co-design callable wrapper...")
-    test_result, hist_state, time_steps, v_z_ref, pa = evaluate_drone_codesign(test_X, dt=dt, t_end=t_end, debug = True)
+    # test_result, hist_state, time_steps, v_x_ref, v_z_ref, pa = evaluate_drone_codesign(test_X, dt=dt, t_end=t_end, debug = True)
+
+    test_result, hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, spl_fine = evaluate_drone_codesign(
+    test_X, dt=dt, t_end=t_end, debug=True
+    )
     
+    # 3. Execute your new Frequency Domain Debugger!
+    spectrum = compute_acoustic_spectrum_debug(spl_fine)
+    
+    # 4. Render the spectrum graph (zoomed to 800 Hz to see key harmonics)
+    plot_acoustic_spectrum(spectrum, max_freq_display=800.0)
+
     print("\n--- Evaluation Test Results ---")
     print(f"Objective (Annoyance Dose): {test_result['objective']}")
     print(f"Is Configuration Feasible?: {test_result['feasible']}")
@@ -817,6 +926,12 @@ if __name__ == "__main__":
     # if test_result['feasible'] and hist_state is not None:
     #     plot_codesign_debug_results(hist_state, time_steps, v_z_ref)
     
-    if test_result['feasible'] and hist_state is not None and pa is not None:
-        plot_comprehensive_diagnostics(hist_state, time_steps, v_z_ref, pa)
+    rpm_history = np.column_stack((
+    rpm_results["rpm_front"],
+    rpm_results["rpm_left"],
+    rpm_results["rpm_right"],
+    rpm_results["rpm_rear"]
+    ))
 
+    if test_result['feasible'] and hist_state is not None and pa is not None:
+        plot_comprehensive_diagnostics(hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, gains = None, gain_bounds=None, rpm_history=rpm_history)
