@@ -110,14 +110,31 @@ def power_to_pressure_amplitude(p_acoustic: np.ndarray, r: np.ndarray, theta_rad
     p_rms = np.sqrt(np.clip(intensity, 0.0, None) * params.rho * params.c_sound)
     return np.sqrt(2.0) * p_rms
 
+def directivity_factor(theta_rad: np.ndarray, w: float = 0.25) -> np.ndarray:
+    """
+    Combined loading & thickness directivity model, normalized to 1.
+    
+    Parameters
+    ----------
+    theta_rad : np.ndarray
+        Angle measured from the rotor thrust axis (rad).
+    w : float
+        Weight parameter [0, 1]. Reflects the proportion of loading noise
+        versus thickness/coplanar noise. (Default of 0.25 is typical for drones).
+    """
+    # Ensure w is clipped between 0 and 1
+    w = np.clip(w, 0.0, 1.0)
+    
+    # 3*cos^2(theta) and 1.5*sin^2(theta) both integrate to 1 over the sphere
+    return w * 3.0 * (np.cos(theta_rad) ** 2) + (1.0 - w) * 1.5 * (np.sin(theta_rad) ** 2)
 
-def directivity_factor(theta_rad: np.ndarray) -> np.ndarray:
-    """
-    Dipole-like directivity factor D(theta), normalized so its average over
-    the full sphere is 1 (sphere-integrated power = P_acoustic, unaffected
-    by directivity shape). theta is measured from the rotor thrust axis.
-    """
-    return 1.5 * np.sin(theta_rad) ** 2
+# def directivity_factor(theta_rad: np.ndarray) -> np.ndarray:
+#     """
+#     Dipole-like directivity factor D(theta), normalized so its average over
+#     the full sphere is 1 (sphere-integrated power = P_acoustic, unaffected
+#     by directivity shape). theta is measured from the rotor thrust axis.
+#     """
+#     return 1.5 * np.sin(theta_rad) ** 2
 
 
 def observer_geometry(x, y, z, observer_xyz, z_up: bool = True):
@@ -452,21 +469,24 @@ def generate_rotor_azimuth(rpm_fine: np.ndarray, t_fine: np.ndarray,
 
 def generate_rotor_azimuth_with_harmonics(rpm_fine: np.ndarray, t_fine: np.ndarray,
                                           r: np.ndarray, theta_rad: np.ndarray,
-                                         acoustic_params: AcousticParams,
-                                         fine_params: FineGridParams = None, rng=None,
-                                         max_harmonics: int = 6, decay_exponent: float = 1.5):
+                                          acoustic_params: AcousticParams,
+                                          fine_params: FineGridParams = None, rng=None,
+                                          max_harmonics: int = 12, decay_exponent: float = 1.5,
+                                          quad_boost: float = 2.5):
     """
     Generate one rotor's synthetic acoustic pressure signal keeping higher 
-    harmonics into account using an empirical power-law amplitude decay.
+    harmonics into account, with a tunable boost for multiples of 4 (quadrotor coupling).
 
     Parameters
     ----------
     ... [same as original parameters] ...
     max_harmonics : int, optional
-        The total number of harmonics to synthesize (default is 3: fundamental, 2nd, 3rd).
+        The total number of harmonics to synthesize (increased to 12 to capture 4, 8, 12).
     decay_exponent : float, optional
-        The power alpha controlling the amplitude decay rate 1 / (n^alpha). 
-        Typically ranges between 1.0 (slower decay) and 2.0 (faster decay).
+        The power alpha controlling the amplitude decay rate 1 / (n^alpha).
+    quad_boost : float, optional
+        Amplification factor for harmonics that are multiples of 4 (n = 4, 8, 12...).
+        Set to 1.0 for standard decay, or higher (e.g., 2.5) to match experimental peaks.
     """
     if fine_params is None:
         fine_params = FineGridParams()
@@ -487,30 +507,25 @@ def generate_rotor_azimuth_with_harmonics(rpm_fine: np.ndarray, t_fine: np.ndarr
         bandwidth_hz=fine_params.disturbance_bandwidth_hz, rng=rng,
     )
 
-    # 3. Get the baseline fundamental peak pressure amplitude from total radiated power
+    # 3. Get the baseline fundamental peak pressure amplitude
     p_acoustic = acoustic_power_per_rotor(rpm_fine, acoustic_params)
     p_peak_fundamental = power_to_pressure_amplitude(p_acoustic, r, theta_rad, acoustic_params)
 
-    # Optional: If your fundamental sound represents Blade Passage Frequency (BPF), 
-    # you can uncomment the line below or handle it externally:
-    # num_blades = 2
-    # phase = num_blades * phase
-
     # 4. Synthesize the pressure wave using a Fourier Series combination
-    # Start with an empty array of zeros matching the fine time grid
     p_rotor = np.zeros_like(t_fine, dtype=float)
 
     for n in range(1, max_harmonics + 1):
-        # Calculate the amplitude decay for the n-th harmonic
-        # n=1 -> 1.0, n=2 -> 0.354, n=3 -> 0.192 (for exponent=1.5)
+        # Base power-law decay
         harmonic_scale = 1.0 / (n ** decay_exponent)
+
+        # Apply the tunable boost if this harmonic is a multiple of 4 (4, 8, 12...)
+        if n % 4 == 0:
+            harmonic_scale *= quad_boost
 
         # Scale the peak pressure for this harmonic
         p_peak_n = p_peak_fundamental * harmonic_scale
 
-        # The phase accelerates linearly with the harmonic order 'n'
-        # Note: The phase jitter (disturbance) scales with 'n' because phase errors 
-        # multiply proportionally in higher frequencies.
+        # Accumulate the harmonic component
         p_rotor += p_peak_n * np.sin(n * (phase + disturbance))
 
     return p_rotor, phase, disturbance

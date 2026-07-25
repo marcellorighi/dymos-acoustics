@@ -18,14 +18,14 @@ from tqdm import tqdm
 
 
 # # --- 1. Global System Parameters ---
-MASS = 6.5              # kg
+# MASS = 6.5              # kg
 # I_xx = 0.012            # kg*m^2
 # I_yy = 0.012            # kg*m^2
 # I_zz = 0.020            # kg*m^2
-g = 9.81                # m/s^2
+# g = 9.81                # m/s^2
 # arm_length = 0.25       # m 
-t_ref = MASS * g /4     # N 
-rpm_ref = 5000.         # RPM 
+# t_ref = MASS * g /4     # N 
+# rpm_ref = 5000.         # RPM 
 
 def compute_acoustic_spectrum_debug(spl_fine):
     """
@@ -253,7 +253,7 @@ def drone_derivatives(t, state, controls):
 
 # --- 2. Step PID Control Updates (Evaluated Once per Step) ---
 class DronePIDController:
-    def __init__(self, kp_vel=0.15, ki_vel=0.05, kp_att=2.5, kd_att=0.4, kp_alt=15.0, kd_alt=10.0, ki_alt=15.0):
+    def __init__(self, kp_vel=0.15, ki_vel=0.05, kp_att=2.5, kd_att=0.4, kp_alt=15.0, kd_alt=10.0, ki_alt=15.0, MASS=1.5, g=9.81):
         # Assign custom gains passed from the optimizer/simulation function
         self.kp_vel = kp_vel
         self.ki_vel = ki_vel
@@ -262,12 +262,23 @@ class DronePIDController:
         self.kp_alt = kp_alt
         self.kd_alt = kd_alt
         self.ki_alt = ki_alt
+        self.MASS = MASS
+        self.g = g
+
+        # --- Actuator Bandwidth Filter Setup ---
+        motor_bandwidth_hz = 10.0  # Adjust based on real drone specs (10-30Hz typical)
+        self.tau = 1.0 / (2.0 * np.pi * motor_bandwidth_hz)
         
         # State tracking (Integrators)
         self.integral_vx = 0.0
         self.integral_vy = 0.0
         self.integral_vz = 0.0
         self.dt = 0.01
+
+        self.F_z_act = MASS * g  # Initialize hovering at equilibrium
+        self.M_x_act = 0.0
+        self.M_y_act = 0.0
+        self.M_z_act = 0.0
 
     def compute_controls_velocity_tracking(self, state, target_velocity, target_yaw):
         vx, vy, vz = state[3:6]
@@ -300,12 +311,26 @@ class DronePIDController:
 
         # 3. Inner Loop & Altitude Controls
         # Note: F_z acts as a pure P-controller on Z-velocity tracking
-        F_z = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (MASS * g)
-        M_x = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
-        M_y = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
-        M_z = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        # --- 1. Compute your explicit commanded values (Raw Ideal Outputs) ---
+        F_z_cmd = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (self.MASS * self.g)
+        M_x_cmd = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
+        M_y_cmd = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
+        M_z_cmd = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        alpha = self.dt / (self.tau + self.dt)
         
-        controls = np.array([0.0, 0.0, F_z, M_x, M_y, M_z])
+        # F_z = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (MASS * g)
+        # M_x = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
+        # M_y = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
+        # M_z = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        self.F_z_act += alpha * (F_z_cmd - self.F_z_act)
+        self.M_x_act += alpha * (M_x_cmd - self.M_x_act)
+        self.M_y_act += alpha * (M_y_cmd - self.M_y_act)
+        self.M_z_act += alpha * (M_z_cmd - self.M_z_act)
+        
+        controls = np.array([0.0, 0.0, self.F_z_act, self.M_x_act, self.M_y_act, self.M_z_act])
         return controls, theta_cmd, phi_cmd
 
 def drone_derivatives_with_turb(t, state, controls, dryden_ts, aero_params=None):
@@ -317,6 +342,8 @@ def drone_derivatives_with_turb(t, state, controls, dryden_ts, aero_params=None)
     I_yy = aero_params['Iyy']
     I_zz = aero_params['Izz']
     L_arm = aero_params['L_arm']
+    MASS = aero_params['MASS']
+    g = aero_params['g']
 
     # Unpack state
     pos = state[0:3]
@@ -438,7 +465,9 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     controller = DronePIDController(
         kp_vel=kp_vel, ki_vel=ki_vel, 
         kp_att=kp_att, kd_att=kd_att, 
-        kp_alt=kp_alt, kd_alt=kd_alt
+        kp_alt=kp_alt, kd_alt=kd_alt,
+        MASS = plant_params.get('MASS',1.5),
+        g=plant_params.get('g',9.81)
     )
     
     # 2. Reset / Pre-allocate matrices
@@ -487,7 +516,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         history_gusts[idx, 4] = np.interp(t, t_ts, dryden_ts['q_turb'])
 
     rpm_result = compute_rotor_rpm_from_controls(time_steps, history_controls, plant_params['L_arm'], 
-                                    t_ref, rpm_ref, plant_params, rpm_min=1000.0, rpm_max=8000.0)
+                                    plant_params['t_ref'], plant_params['rpm_ref'], plant_params, rpm_min=1000.0, rpm_max=8000.0)
     
     # Model Calibration
     p_ref = calibrate_p_ref(
@@ -595,7 +624,10 @@ def update_drone_geometry(R_rotor: float, L_arm: float, baseline_params: dict = 
     m_motor_prop = 0.15  # kg per motor+prop assembly
     
     total_mass = m_body + 4 * (L_arm * m_per_meter_arm + m_motor_prop)
-    p['mass'] = total_mass
+    p['MASS'] = total_mass
+    p['g'] = 9.81 
+    p['t_ref'] = p['MASS']  * p['g'] /4     # N 
+    p['rpm_ref'] = 5000.
     
     # 3. Update Moments of Inertia (Solid Mechanics Matrix)
     # Using parallel axis theorem approximations for a quadcopter layout
@@ -1002,17 +1034,7 @@ def plot_comprehensive_diagnostics(hist_state, time_steps, v_x_ref, v_y_ref, v_z
 
 if __name__ == "__main__":
 
-    # --- 1. Global System Parameters ---
-    # MASS = 1.5              # kg
-    # # I_xx = 0.012            # kg*m^2
-    # # I_yy = 0.012            # kg*m^2
-    # # I_zz = 0.020            # kg*m^2
-    # g = 9.81                # m/s^2
-    # arm_length = 0.25       # m 
-    # t_ref = MASS * g /4     # N 
-    # rpm_ref = 5000.         # RPM 
-
-    dt = 0.015 
+    dt = 0.002 
     t_end = 12.01
     vz_max = 5.0 
     vx_max = 5.00 
@@ -1045,7 +1067,7 @@ if __name__ == "__main__":
     # test_result, hist_state, time_steps, v_x_ref, v_z_ref, pa = evaluate_drone_codesign(test_X, dt=dt, t_end=t_end, debug = True)
 
     test_result, hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, spl_fine = evaluate_drone_codesign(
-    test_X, initial_state=my_init_state, dt=dt, t_end=t_end, debug=True, mode='hover'
+    test_X, initial_state=my_init_state, dt=dt, t_end=t_end, debug=True, mode='climb_cruise'
     )
        
     # 3. Execute your new Frequency Domain Debugger!

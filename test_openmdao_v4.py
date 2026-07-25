@@ -1,7 +1,7 @@
 import openmdao.api as om
 import numpy as np
-from drone_pid_function_v13 import evaluate_drone_codesign
-from drone_pid_function_v13 import plot_comprehensive_diagnostics
+from drone_pid_function_v16 import evaluate_drone_codesign
+from drone_pid_function_v16 import plot_comprehensive_diagnostics
 class DroneCoDesignComponent(om.ExplicitComponent):
     """
     Wraps your updated 12-dimensional simulation into an OpenMDAO component.
@@ -39,7 +39,8 @@ class DroneCoDesignComponent(om.ExplicitComponent):
         ]
         
         # Execute your updated multi-objective function wrapper
-        result = evaluate_drone_codesign(X, dt=0.01, t_end=4.0, debug=False)
+        # result = evaluate_drone_codesign(X, dt=0.01, t_end=4.0, debug=False)
+        result = evaluate_drone_codesign(X, initial_state=my_init_state, dt=0.005, t_end=8.0, debug=False, mode='climb_cruise')
         
         # Pass the scalar objective tracking combo out to OpenMDAO
         outputs['combined_cost'] = result['objective']
@@ -50,6 +51,11 @@ class DroneCoDesignComponent(om.ExplicitComponent):
 if __name__ == "__main__":
     prob = om.Problem()
     model = prob.model
+
+    # initial conditions 
+    my_init_state = np.zeros(12)
+    my_init_state[2] = 0.0 # 10 meters altitude
+    mode = 'climb_cruise'
     
     model.add_subsystem('drone_sim', DroneCoDesignComponent(), promotes=['*'])
     
@@ -90,19 +96,19 @@ if __name__ == "__main__":
     prob.setup()
 
     # Define all baseline parameters right here before running the driver
-    prob.set_val('R_rotor', 0.14)   
-    prob.set_val('L_arm',   0.36)   
+    prob.set_val('R_rotor', 0.24)   
+    prob.set_val('L_arm',   0.24)   
     prob.set_val('v_max',   5.85)    
-    prob.set_val('t_climb', 4.7)    
+    prob.set_val('t_climb', 4.3)    
     prob.set_val('vx_max',  6.0)     # Initial forward speed suggestion (e.g. 3m/s)
     prob.set_val('vy_max',  0.0)     
     
     prob.set_val('Kp_vel',  0.187)
-    prob.set_val('Ki_vel',  0.019)
-    prob.set_val('Kp_att',  3.2)
-    prob.set_val('Kd_att',  0.7)
-    prob.set_val('Kp_alt', 17.0)
-    prob.set_val('Kd_alt',  6.7)
+    prob.set_val('Ki_vel',  0.119)
+    prob.set_val('Kp_att',  4.9)
+    prob.set_val('Kd_att',  0.3)
+    prob.set_val('Kp_alt', 21.0)
+    prob.set_val('Kd_alt',  4.7)
 
     prob.run_driver()
     
@@ -137,8 +143,8 @@ if __name__ == "__main__":
     
     # Run the wrapper one final time with debug=True using the optimal vector
     res_dict, hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa = evaluate_drone_codesign(
-        X_opt, dt=0.01, t_end=12.0, debug=True
-    )
+        X_opt, initial_state=my_init_state, dt=0.01, t_end=12.0, debug=True, mode=mode
+        )
     
     # Call your comprehensive plotting dashboard function (passing all required 3D trajectories)
     if hist_state is not None and pa is not None:

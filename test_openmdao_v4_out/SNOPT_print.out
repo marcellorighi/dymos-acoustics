@@ -132,11 +132,12 @@
 
  XXX  The objective  gradients seem to be incorrect.
 
- Gradient projected in one direction   8.76992345509E-01
- Difference approximation              1.52360720360E+00
+ Gradient projected in one direction   5.44674837567E+02
+ Difference approximation              1.27195260238E+03
 1
 
 
 
    Itns Major Minors    Step   nCon Feasible  Optimal  MeritFunction     L+U BSwap     nS condZHZ Penalty
-      8     0      8              1 (0.0E+00) 2.7E-01  2.1369989E+00       1            5 1.0E+00         _  r
+      7     0      7              1 (0.0E+00) 5.1E-01  5.7867887E+01       1            4 1.0E+00         _  r
+     11     1      4 8.8E-02      4 (0.0E+00) 3.1E-01  5.5624802E+01       1            5 1.0E+00         _  r

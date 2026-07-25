@@ -9,23 +9,12 @@ from drone_acoustic_radiation_v3 import (
         calibrate_p_ref, AcousticParams, FineGridParams,
         estimate_received_spl_fine,
     )
-from zwicker_annoyance_v2 import compute_zwicker_indicators_windowed
+from zwicker_annoyance_v3 import compute_zwicker_indicators_windowed
 import pandas as pd
 from scipy.stats import qmc  # Requires scipy >= 1.7.0 for Latin Hypercube
 from SALib.sample import sobol as sobol_sampler
 from SALib.analyze import sobol as sobol_analyzer
 from tqdm import tqdm
-
-
-# # --- 1. Global System Parameters ---
-MASS = 6.5              # kg
-# I_xx = 0.012            # kg*m^2
-# I_yy = 0.012            # kg*m^2
-# I_zz = 0.020            # kg*m^2
-g = 9.81                # m/s^2
-# arm_length = 0.25       # m 
-t_ref = MASS * g /4     # N 
-rpm_ref = 5000.         # RPM 
 
 def compute_acoustic_spectrum_debug(spl_fine):
     """
@@ -194,66 +183,66 @@ def compute_rotor_rpm_from_controls(time_steps, history_controls, arm_length,
         "thrust_avg": thrust_avg
     }
 
-def drone_derivatives(t, state, controls):
-    """
-    Calculates the right-hand side (derivatives) of the 6-DoF equations of motion.
-    """
-    # Unpack state
-    pos = state[0:3]
-    vel = state[3:6]
-    euler = state[6:9]
-    omega = state[9:12]
+# def drone_derivatives(t, state, controls):
+#     """
+#     Calculates the right-hand side (derivatives) of the 6-DoF equations of motion.
+#     """
+#     # Unpack state
+#     pos = state[0:3]
+#     vel = state[3:6]
+#     euler = state[6:9]
+#     omega = state[9:12]
     
-    phi, theta, psi = euler
-    p, q, r = omega
+#     phi, theta, psi = euler
+#     p, q, r = omega
     
-    # Unpack pre-computed controls (frozen for the current timestep)
-    F_x, F_y, F_z, M_x, M_y, M_z = controls
+#     # Unpack pre-computed controls (frozen for the current timestep)
+#     F_x, F_y, F_z, M_x, M_y, M_z = controls
     
-    # --- Translational Dynamics (Inertial Frame) ---
-    # Gravity acts along the negative Z axis
-    gravity_force = np.array([0.0, 0.0, -MASS * g])
+#     # --- Translational Dynamics (Inertial Frame) ---
+#     # Gravity acts along the negative Z axis
+#     gravity_force = np.array([0.0, 0.0, -MASS * g])
     
-    # Rotation matrix from Body Frame to Inertial Frame (Z-Y-X sequence)
-    R_x = np.array([[1, 0, 0], [0, np.cos(phi), -np.sin(phi)], [0, np.sin(phi), np.cos(phi)]])
-    R_y = np.array([[np.cos(theta), 0, np.sin(theta)], [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
-    R_z = np.array([[np.cos(psi), -np.sin(psi), 0], [np.sin(psi), np.cos(psi), 0], [0, 0, 1]])
-    R_body_to_inertial = R_z @ R_y @ R_x
+#     # Rotation matrix from Body Frame to Inertial Frame (Z-Y-X sequence)
+#     R_x = np.array([[1, 0, 0], [0, np.cos(phi), -np.sin(phi)], [0, np.sin(phi), np.cos(phi)]])
+#     R_y = np.array([[np.cos(theta), 0, np.sin(theta)], [0, 1, 0], [-np.sin(theta), 0, np.cos(theta)]])
+#     R_z = np.array([[np.cos(psi), -np.sin(psi), 0], [np.sin(psi), np.cos(psi), 0], [0, 0, 1]])
+#     R_body_to_inertial = R_z @ R_y @ R_x
     
-    # Total thrust vector in body frame (F_z is the primary collective thrust)
-    # Including optional direct body forces F_x, F_y if your specific drone configuration has them
-    total_force_body = np.array([F_x, F_y, F_z])
-    total_force_inertial = R_body_to_inertial @ total_force_body + gravity_force
+#     # Total thrust vector in body frame (F_z is the primary collective thrust)
+#     # Including optional direct body forces F_x, F_y if your specific drone configuration has them
+#     total_force_body = np.array([F_x, F_y, F_z])
+#     total_force_inertial = R_body_to_inertial @ total_force_body + gravity_force
     
-    accel = total_force_inertial / MASS
+#     accel = total_force_inertial / MASS
     
-    # --- Rotational Kinematics (Euler Angle Derivatives) ---
-    # Transforms body angular velocities (p,q,r) to earth-fixed Euler rate changes
-    d_euler = np.array([
-        [1, np.sin(phi)*np.tan(theta), np.cos(phi)*np.tan(theta)],
-        [0, np.cos(phi), -np.sin(phi)],
-        [0, np.sin(phi)/np.cos(theta), np.cos(phi)/np.cos(theta)]
-    ]) @ omega
+#     # --- Rotational Kinematics (Euler Angle Derivatives) ---
+#     # Transforms body angular velocities (p,q,r) to earth-fixed Euler rate changes
+#     d_euler = np.array([
+#         [1, np.sin(phi)*np.tan(theta), np.cos(phi)*np.tan(theta)],
+#         [0, np.cos(phi), -np.sin(phi)],
+#         [0, np.sin(phi)/np.cos(theta), np.cos(phi)/np.cos(theta)]
+#     ]) @ omega
 
-    # --- Rotational Dynamics (Euler's Rigid Body Equations in Body Frame) ---
-    dp = (M_x - (I_zz - I_yy) * q * r) / I_xx
-    dq = (M_y - (I_xx - I_zz) * p * r) / I_yy
-    dr = (M_z - (I_yy - I_xx) * p * q) / I_zz
-    d_omega = np.array([dp, dq, dr])
+#     # --- Rotational Dynamics (Euler's Rigid Body Equations in Body Frame) ---
+#     dp = (M_x - (I_zz - I_yy) * q * r) / I_xx
+#     dq = (M_y - (I_xx - I_zz) * p * r) / I_yy
+#     dr = (M_z - (I_yy - I_xx) * p * q) / I_zz
+#     d_omega = np.array([dp, dq, dr])
     
-    # Pack array derivatives
-    dstatedt = np.zeros(12)
-    dstatedt[0:3]  = vel      # dpos/dt
-    dstatedt[3:6]  = accel    # dvel/dt
-    dstatedt[6:9]  = d_euler  # deuler/dt
-    dstatedt[9:12] = d_omega  # domega/dt
+#     # Pack array derivatives
+#     dstatedt = np.zeros(12)
+#     dstatedt[0:3]  = vel      # dpos/dt
+#     dstatedt[3:6]  = accel    # dvel/dt
+#     dstatedt[6:9]  = d_euler  # deuler/dt
+#     dstatedt[9:12] = d_omega  # domega/dt
     
-    return dstatedt
+#     return dstatedt
 
 
 # --- 2. Step PID Control Updates (Evaluated Once per Step) ---
 class DronePIDController:
-    def __init__(self, kp_vel=0.15, ki_vel=0.05, kp_att=2.5, kd_att=0.4, kp_alt=15.0, kd_alt=10.0, ki_alt=15.0):
+    def __init__(self, kp_vel=0.15, ki_vel=0.05, kp_att=2.5, kd_att=0.4, kp_alt=15.0, kd_alt=10.0, ki_alt=15.0, MASS=1.5, g=9.81, motor_bandwidth_hz=10.0):
         # Assign custom gains passed from the optimizer/simulation function
         self.kp_vel = kp_vel
         self.ki_vel = ki_vel
@@ -262,12 +251,35 @@ class DronePIDController:
         self.kp_alt = kp_alt
         self.kd_alt = kd_alt
         self.ki_alt = ki_alt
+        self.MASS = MASS
+        self.g = g
+
+        # --- Actuator Bandwidth Filter Setup ---
+        self.motor_bandwidth_hz = motor_bandwidth_hz  # Adjust based on real drone specs (10-30Hz typical)
+        self.tau = 1.0 / (2.0 * np.pi * self.motor_bandwidth_hz)
+
+        # =====================================================================
+        # --- CONTROLLER INSTANTIATION AUDIT ---
+        # =====================================================================
+        print("\n" + " 🎮 CONTROLLER LIVE GAIN AUDIT ".center(50, "═"))
+        print(f" • Translational Vel Gain (ki_vel): {self.ki_vel:.4f}")
+        print(f" • Translational Vel Gain (kp_vel): {self.kp_vel:.4f}")
+        print(f" • Altitude Control Gains:          kp={self.kp_alt:.2f}, kd={self.kd_alt:.2f}, ki={self.ki_alt:.2f}")
+        print(f" • Attitude Control Gains:          kp={self.kp_att:.2f}, kd={self.kd_att:.2f}")
+        print(f" • Actuator Target Bandwidth:       {self.motor_bandwidth_hz:.2f} Hz (𝜏 = {self.tau:.4f}s)")
+        print(f" • Expected Feedforward Hover Mass: {self.MASS:.4f} kg")
+        print("═"*50 + "\n")
         
         # State tracking (Integrators)
         self.integral_vx = 0.0
         self.integral_vy = 0.0
         self.integral_vz = 0.0
         self.dt = 0.01
+
+        self.F_z_act = MASS * g  # Initialize hovering at equilibrium
+        self.M_x_act = 0.0
+        self.M_y_act = 0.0
+        self.M_z_act = 0.0
 
     def compute_controls_velocity_tracking(self, state, target_velocity, target_yaw):
         vx, vy, vz = state[3:6]
@@ -300,12 +312,26 @@ class DronePIDController:
 
         # 3. Inner Loop & Altitude Controls
         # Note: F_z acts as a pure P-controller on Z-velocity tracking
-        F_z = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (MASS * g)
-        M_x = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
-        M_y = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
-        M_z = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        # --- 1. Compute your explicit commanded values (Raw Ideal Outputs) ---
+        F_z_cmd = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (self.MASS * self.g)
+        M_x_cmd = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
+        M_y_cmd = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
+        M_z_cmd = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        alpha = self.dt / (self.tau + self.dt)
         
-        controls = np.array([0.0, 0.0, F_z, M_x, M_y, M_z])
+        # F_z = self.kp_alt * (target_velocity[2] - vz) + self.ki_alt * self.integral_vz + (MASS * g)
+        # M_x = self.kp_att * (phi_cmd - phi) + self.kd_att * (0.0 - p)
+        # M_y = self.kp_att * (theta_cmd - theta) + self.kd_att * (0.0 - q)
+        # M_z = self.kp_att * (target_yaw - psi) + self.kd_att * (0.0 - r)
+
+        self.F_z_act += alpha * (F_z_cmd - self.F_z_act)
+        self.M_x_act += alpha * (M_x_cmd - self.M_x_act)
+        self.M_y_act += alpha * (M_y_cmd - self.M_y_act)
+        self.M_z_act += alpha * (M_z_cmd - self.M_z_act)
+        
+        controls = np.array([0.0, 0.0, self.F_z_act, self.M_x_act, self.M_y_act, self.M_z_act])
         return controls, theta_cmd, phi_cmd
 
 def drone_derivatives_with_turb(t, state, controls, dryden_ts, aero_params=None):
@@ -317,6 +343,8 @@ def drone_derivatives_with_turb(t, state, controls, dryden_ts, aero_params=None)
     I_yy = aero_params['Iyy']
     I_zz = aero_params['Izz']
     L_arm = aero_params['L_arm']
+    MASS = aero_params.get('mass', aero_params.get('MASS'))
+    g = aero_params['g']
 
     # Unpack state
     pos = state[0:3]
@@ -438,7 +466,10 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     controller = DronePIDController(
         kp_vel=kp_vel, ki_vel=ki_vel, 
         kp_att=kp_att, kd_att=kd_att, 
-        kp_alt=kp_alt, kd_alt=kd_alt
+        kp_alt=kp_alt, kd_alt=kd_alt,
+        MASS = plant_params.get('MASS',1.5),
+        g=plant_params.get('g',9.81),
+        motor_bandwidth_hz=plant_params.get('motor_bandwidth_hz')
     )
     
     # 2. Reset / Pre-allocate matrices
@@ -458,6 +489,24 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     history_accel = np.zeros((len(time_steps), 3))
     history_gusts = np.zeros((len(time_steps), 5))  # wu, wv, ww, p_turb, q_turb
     history_controls = np.zeros((len(time_steps), 6))
+
+    # =========================================================================
+    # --- PLANT PARAMETER DIAGNOSTIC REPORT ---
+    # =========================================================================
+    print("\n" + "="*50)
+    print(" 🛠️  DYMOS ACOUSTICS INTEGRATOR INITIALIZATION REPORT")
+    print("="*50)
+    print(f" • Arm Length (L_arm):     {plant_params.get('L_arm'):.4f} m")
+    print(f" • Rotor Radius (R_rotor):  {plant_params.get('R_rotor'):.4f} m")
+    print(f" • Extracted Mass (MASS):   {plant_params.get('mass', plant_params.get('MASS')):.4f} kg")
+    print(f" • Gravity Constant (g):   {plant_params.get('g'):.2f} m/s²")
+    print(f" • Inertia Tensor (Ixx):   {plant_params.get('Ixx'):.6f} kg·m²")
+    print(f" • Inertia Tensor (Iyy):   {plant_params.get('Iyy'):.6f} kg·m²")
+    print(f" • Inertia Tensor (Izz):   {plant_params.get('Izz'):.6f} kg·m²")
+    print(f" • Motor Bandwidth:        {plant_params.get('motor_bandwidth_hz', 'N/A')} Hz")
+    print(f" • Velocity Int. (ki_vel): {plant_params.get('ki_vel', 'N/A')}")
+    print("="*50)
+    print("▶ Running numerical time integration loop...")
 
     # 3. Core Simulation Loop
     for idx, t in enumerate(time_steps):
@@ -487,7 +536,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         history_gusts[idx, 4] = np.interp(t, t_ts, dryden_ts['q_turb'])
 
     rpm_result = compute_rotor_rpm_from_controls(time_steps, history_controls, plant_params['L_arm'], 
-                                    t_ref, rpm_ref, plant_params, rpm_min=1000.0, rpm_max=8000.0)
+                                    plant_params['t_ref'], plant_params['rpm_ref'], plant_params, rpm_min=1000.0, rpm_max=8000.0)
     
     # Model Calibration
     p_ref = calibrate_p_ref(
@@ -576,43 +625,46 @@ def generate_dynamic_trajectory(
     return velocity_schedule_waypoints, time_steps, v_x_reference_array, v_y_reference_array, v_z_reference_array
 
 
-def update_drone_geometry(R_rotor: float, L_arm: float, baseline_params: dict = None):
-    """
-    Translates raw geometric choices from the co-design optimizer into 
-    physically consistent mass, inertia, and aerodynamic scaling factors.
-    """
-    # Start with a baseline config dictionary if provided, or define defaults
-    p = baseline_params.copy() if baseline_params else {}
+# def update_drone_geometry(R_rotor: float, L_arm: float, baseline_params: dict = None):
+#     """
+#     Translates raw geometric choices from the co-design optimizer into 
+#     physically consistent mass, inertia, and aerodynamic scaling factors.
+#     """
+#     # Start with a baseline config dictionary if provided, or define defaults
+#     p = baseline_params.copy() if baseline_params else {}
     
-    # 1. Assign the raw geometric values
-    p['R_rotor'] = R_rotor
-    p['L_arm'] = L_arm
+#     # 1. Assign the raw geometric values
+#     p['R_rotor'] = R_rotor
+#     p['L_arm'] = L_arm
     
-    # 2. Update Drone Mass Properties (Approximation)
-    # Assume a fixed central chassis mass, but arm mass scales with length
-    m_body = 1.2  # kg (central electronics, battery, camera)
-    m_per_meter_arm = 0.4  # kg/m for carbon fiber tubes
-    m_motor_prop = 0.15  # kg per motor+prop assembly
+#     # 2. Update Drone Mass Properties (Approximation)
+#     # Assume a fixed central chassis mass, but arm mass scales with length
+#     m_body = 1.2  # kg (central electronics, battery, camera)
+#     m_per_meter_arm = 0.4  # kg/m for carbon fiber tubes
+#     m_motor_prop = 0.15  # kg per motor+prop assembly
     
-    total_mass = m_body + 4 * (L_arm * m_per_meter_arm + m_motor_prop)
-    p['mass'] = total_mass
+#     total_mass = m_body + 4 * (L_arm * m_per_meter_arm + m_motor_prop)
+#     p['MASS'] = total_mass
+#     p['g'] = 9.81 
+#     p['t_ref'] = p['MASS']  * p['g'] /4     # N 
+#     p['rpm_ref'] = 5000.
     
-    # 3. Update Moments of Inertia (Solid Mechanics Matrix)
-    # Using parallel axis theorem approximations for a quadcopter layout
-    p['Ixx'] = 0.5 * m_body * (0.15**2) + 2 * m_motor_prop * (L_arm**2)
-    p['Iyy'] = 0.5 * m_body * (0.15**2) + 2 * m_motor_prop * (L_arm**2)
-    p['Izz'] = p['Ixx'] + p['Iyy']  # Perpendicular axis theorem approximation
+#     # 3. Update Moments of Inertia (Solid Mechanics Matrix)
+#     # Using parallel axis theorem approximations for a quadcopter layout
+#     p['Ixx'] = 0.5 * m_body * (0.15**2) + 2 * m_motor_prop * (L_arm**2)
+#     p['Iyy'] = 0.5 * m_body * (0.15**2) + 2 * m_motor_prop * (L_arm**2)
+#     p['Izz'] = p['Ixx'] + p['Iyy']  # Perpendicular axis theorem approximation
     
-    # 4. Scale Aerodynamic Coefficients Based on Propeller Scaling Laws
-    # Thrust coefficient scales roughly with R^4, Torque with R^5
-    R_ref = 0.127  # Reference radius (e.g., standard 5-inch prop = 0.127m)
-    kt_ref = 2.9e-5
-    kq_ref = 1.1e-6
+#     # 4. Scale Aerodynamic Coefficients Based on Propeller Scaling Laws
+#     # Thrust coefficient scales roughly with R^4, Torque with R^5
+#     R_ref = 0.127  # Reference radius (e.g., standard 5-inch prop = 0.127m)
+#     kt_ref = 2.9e-5
+#     kq_ref = 1.1e-6
     
-    p['kt'] = kt_ref * (R_rotor / R_ref)**4
-    p['kq'] = kq_ref * (R_rotor / R_ref)**5
+#     p['kt'] = kt_ref * (R_rotor / R_ref)**4
+#     p['kq'] = kq_ref * (R_rotor / R_ref)**5
     
-    return p
+#     return p
 
 def check_tracking_performance(hist_state, v_z_ref, max_allowable_error=6.0):
     """
@@ -763,11 +815,16 @@ def evaluate_drone_codesign(X, initial_state, dt, t_end, debug=False, mode='clim
     # 1. UNPACK THE DESIGN VECTOR
     R_rotor   = float(X[0])
     L_arm     = float(X[1])
-    vz_max     = float(X[2])   
+    vz_max    = float(X[2])   
     t_climb   = float(X[3])
     vx_max    = float(X[4])   
     vy_max    = float(X[5])   
     gains     = [float(val) for val in X[6:12]]
+    
+    # Extract the new dynamic design variables from the tail of X
+    # Ensure your optimizer boundaries/bounds array matches this length (14 parameters total)
+    motor_bw  = float(X[12]) if len(X) > 12 else 10.0
+    ki_v      = float(X[13]) if len(X) > 13 else 0.05
 
     # 2. GENERATE ENVIRONMENTAL WIND NOISE & TARGET TRAJECTORY
     t_dryden = np.arange(0, t_end + dt, dt)
@@ -787,22 +844,29 @@ def evaluate_drone_codesign(X, initial_state, dt, t_end, debug=False, mode='clim
         vx_max, vy_max, vz_max, t_climb, dt=dt, t_total=t_end, mode=mode
     )
     
-    drone_params = update_drone_geometry(R_rotor, L_arm)
+    # 3. INITIALIZE PARAMETrIC PLANT (The new source of truth)
+    opt_design_vars = {
+        'motor_bandwidth_hz': motor_bw,
+        'ki_vel': ki_v
+    }
+    
+    plant = ParametricDronePlant(
+        arm_length=L_arm, 
+        rotor_radius=R_rotor, 
+        design_vars=opt_design_vars
+    )
+    drone_params = plant.to_dict()
 
     if debug:
-        # --- BYPASS MODE (Runs raw without try/except net for easier bug hunting) ---
+        # --- BYPASS MODE ---
         outputs = run_drone_acoustic_simulation(
             gains, dryden_ts, waypoints, time_steps, dt=dt, plant_params=drone_params, initial_state=initial_state
         )
         spl_fine, pa, rpm_results, hist_state, _, _, _ = outputs
         
-        # Call separated objective engine (Weights matching optimizer config: alpha=0.4, beta=0.2)
-        # cost, noise, itae, speed_penalty = compute_combined_objective(
-        #     hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, vx_max, vz_max, alpha=0.4, beta=0.2, p=1
-        # )
-
+        # 💡 Fixed: mode=mode ensures hover/fly_by logic scales correctly
         total_objective, acoustic_cost, itae_penalty, slowness_penalty, efficiency_cost = calculate_optimization_objective(hist_state, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, time_steps, mode='climb_cruise')
-        
+                
         result_dict = {"objective": total_objective, "feasible": True}
         return result_dict, hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, spl_fine
     
@@ -813,20 +877,16 @@ def evaluate_drone_codesign(X, initial_state, dt, t_end, debug=False, mode='clim
                 gains, dryden_ts, waypoints, time_steps, dt=dt, plant_params=drone_params, initial_state=initial_state
             )
             spl_fine, pa, rpm_result, hist_state, _, _, _ = outputs
-            # spl_fine, pa, rpm_result, history_state, history_controls, history_accel, history_gusts
-            # Enforce the tracking safety constraint during optimization
+            
             if check_tracking_performance(hist_state, v_z_ref):
                 return {"objective": 99.0, "feasible": False}
                 
-            # Call separated objective engine
-            # cost, noise, itae, speed_penalty = compute_combined_objective(
-            #     hist_state, time_steps, v_x_ref, v_y_ref, v_z_ref, pa, vx_max, vz_max, alpha=0.4, beta=0.2, p=1
-            # )
+            # 💡 Fixed: mode=mode handles dynamic tracking penalties
+            total_objective, acoustic_cost, itae_penalty, slowness_penalty, efficiency_cost = calculate_optimization_objective(
+                hist_state, v_x_ref, v_y_ref, v_z_ref, pa, rpm_result, time_steps, mode=mode
+            )
 
-            total_objective, acoustic_cost, itae_penalty, slowness_penalty, efficiency_cost = calculate_optimization_objective(hist_state, v_x_ref, v_y_ref, v_z_ref, pa, rpm_result, time_steps, mode='climb_cruise')
-
-            print(f"Cost: {total_objective:.4f} (Noise: {acoustic_cost:.2f}, ITAE: {itae_penalty:.2f}, Speed: {slowness_penalty:.2f}), Efficiency: {efficiency_cost:.2f}))")
-            # print(f"Cost: {cost:.4f} (Noise: {noise:.2f}, ITAE: {itae:.2f}, Speed: {speed_penalty:.2f}))")
+            print(f"[{mode.upper()}] Cost: {total_objective:.4f} (Noise: {acoustic_cost:.2f}, ITAE: {itae_penalty:.2f}, Efficiency: {efficiency_cost:.2f})")
             return {"objective": total_objective, "feasible": True}
             
         except Exception as e:
@@ -1000,35 +1060,105 @@ def plot_comprehensive_diagnostics(hist_state, time_steps, v_x_ref, v_y_ref, v_z
         
     plt.show()
 
+class ParametricDronePlant:
+    def __init__(self, arm_length: float, rotor_radius: float, design_vars: dict = None):
+        # 1. Core structural design variables
+        self.L_arm = arm_length
+        self.R_rotor = rotor_radius
+        
+        # Unpack dynamic optimization parameters (gains, bandwidths, etc.)
+        self.dv = design_vars if design_vars is not None else {}
+        self.motor_bandwidth_hz = self.dv.get('motor_bandwidth_hz', 10.0)
+        # self.ki_vel = self.dv.get('ki_vel', 0.05)
+
+        # Fixed baseline physical constants
+        self.g = 9.81
+        self.m_body = 1.2             # kg (central electronics, battery, camera)
+        self.m_per_meter_arm = 0.4    # kg/m for carbon fiber tubes
+        self.m_motor_prop = 0.15      # kg per motor+prop assembly
+        
+        # Reference properties for aerodynamic scaling laws
+        self.R_ref = 0.127            # Reference radius (standard 5-inch prop)
+        self.kt_ref = 2.9e-5
+        self.kq_ref = 1.1e-6
+        
+        # Fixed reference RPM from your old function
+        self.rpm_ref = 5000.0
+
+    # 2. Derived Variable: Total mass updates dynamically based on geometry
+    @property
+    def mass(self):
+        return self.m_body + 4.0 * (self.L_arm * self.m_per_meter_arm + self.m_motor_prop)
+
+    # 💡 NEW Derived Variable: Reference thrust per rotor based on dynamic mass
+    @property
+    def t_ref(self):
+        return (self.mass * self.g) / 4.0
+
+    # 3. Derived Variables: Moments of inertia (Solid mechanics matrix)
+    @property
+    def Ixx(self):
+        return 0.5 * self.m_body * (0.15**2) + 2.0 * self.m_motor_prop * (self.L_arm**2)
+
+    @property
+    def Iyy(self):
+        return 0.5 * self.m_body * (0.15**2) + 2.0 * self.m_motor_prop * (self.L_arm**2)
+
+    @property
+    def Izz(self):
+        return self.Ixx + self.Iyy
+
+    # 4. Derived Variables: Aerodynamic coefficients scaling with R^4 and R^5
+    @property
+    def kt(self):
+        return self.kt_ref * (self.R_rotor / self.R_ref)**4
+
+    @property
+    def kq(self):
+        return self.kq_ref * (self.R_rotor / self.R_ref)**5
+
+    # 5. Dictionary Compatibility Layer
+    def to_dict(self):
+        """Outputs a clean parameter dictionary matching all your old keys."""
+        return {
+            'L_arm': self.L_arm,
+            'R_rotor': self.R_rotor,
+            'mass': self.mass,
+            'g': self.g,
+            't_ref': self.t_ref,        # 💡 Transferred cleanly
+            'rpm_ref': self.rpm_ref,    # 💡 Transferred cleanly
+            'Ixx': self.Ixx,
+            'Iyy': self.Iyy,
+            'Izz': self.Izz,
+            'kt': self.kt,
+            'kq': self.kq,
+            'motor_bandwidth_hz': self.motor_bandwidth_hz
+            # 'ki_vel': self.ki_vel
+        }
+
 if __name__ == "__main__":
 
-    # --- 1. Global System Parameters ---
-    # MASS = 1.5              # kg
-    # # I_xx = 0.012            # kg*m^2
-    # # I_yy = 0.012            # kg*m^2
-    # # I_zz = 0.020            # kg*m^2
-    # g = 9.81                # m/s^2
-    # arm_length = 0.25       # m 
-    # t_ref = MASS * g /4     # N 
-    # rpm_ref = 5000.         # RPM 
-
-    dt = 0.015 
+    dt = 0.002 
     t_end = 12.01
     vz_max = 5.0 
     vx_max = 5.00 
     vy_max = 0. 
     t_climb = 3.0
 
-    # Define a test drone configuration (middle of the bounds)
-    test_X = [0.22, 0.25,  vz_max, t_climb, vx_max, vy_max, 0.15, 0.04, 3.0, 0.5, 15.0, 7.0]
-    
-    # # --- ADD THIS TEMPORARY PRINT BLOCK TO YOUR MAIN ---
-    # outputs_traj = generate_dynamic_trajectory(
-    #     vx_max, vy_max, vx_max, t_climb, dt=dt, t_total=t_end,
-    #     mode='hover'
-    # )
+    # Define our new explicit optimization/test parameters
+    motor_bandwidth_hz = 10.0 
+    test_ki_vel = 0.04  # Explicitly setting the velocity integrator gain
 
-    # waypoints, time_steps, v_x_ref, v_y_ref, v_z_ref = outputs_traj
+    # Define a test drone configuration (14 elements total)
+    test_X = [
+        0.22, 0.25,                 # 0, 1: Geometry (R_rotor, L_arm)
+        vz_max, t_climb,            # 2, 3: Trajectory Profile
+        vx_max, vy_max,             # 4, 5: Trajectory Profile
+        0.15, 0.04, 3.0,            # 6, 7, 8: First 3 Controller Gains
+        0.5, 15.0, 7.0,             # 9, 10, 11: Last 3 Controller Gains
+        motor_bandwidth_hz,         # 12: Motor Bandwidth
+        test_ki_vel                 # 13: Velocity Integrator Gain (ki_vel)
+    ]
 
     # Set drone starting position to 10m up, sitting perfectly still
     my_init_state = np.zeros(12)
