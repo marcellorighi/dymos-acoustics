@@ -1,0 +1,1006 @@
+#!/usr/bin/env python3
+"""
+Analisi armonica robusta dei WAV NEAPTIDE – DJI Matrice 300 RTK.
+
+Versione "safe":
+- evita pandas;
+- evita scipy.signal;
+- evita numpy.polyfit;
+- estrae i picchi usando intervalli contigui;
+- salva CSV con il modulo standard csv;
+- stampa un checkpoint dopo ogni passaggio;
+- conserva i risultati parziali anche se una fase successiva fallisce.
+"""
+
+from __future__ import annotations
+
+import os
+
+# Impostare i limiti PRIMA di importare NumPy/Matplotlib.
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+os.environ["OPENBLAS_NUM_THREADS"] = "1"
+os.environ["NUMEXPR_NUM_THREADS"] = "1"
+os.environ["VECLIB_MAXIMUM_THREADS"] = "1"
+
+import argparse
+import csv
+import math
+import re
+import statistics
+import sys
+import traceback
+from pathlib import Path
+from typing import Any
+
+# import matplotlib
+
+# matplotlib.use("Agg")
+
+import matplotlib.pyplot as plt
+import numpy as np
+from scipy.io import wavfile
+from scipy import signal as scipy_signal
+
+
+P0_UPA = 20.0
+
+DEFAULT_INPUT_DIR = Path(
+    r"U:\GitHub\DRACONIAN\Acoustic Data"
+    r"\SegmentedAudio_Matrice\SegmentedAudio_Matrice"
+)
+#    / "DJIMavic2Enterprise"
+#     / "HolybroS500"
+#    / "TarotX6_B1"
+#    / "TarotX6_B2"
+
+DEFAULT_INPUT_DIR = (
+    Path.home()
+    / "Documents"
+    / "zhaw"
+    / "BAZL"
+    / "DRACONIAN" 
+    / "Dymos"
+    / "Acoustics"
+    / "Neaptide_data"
+    / "TarotX6_B2"
+)
+
+DEFAULT_OUTPUT_DIR = (
+    Path.home()
+    / "Documents"
+    / "zhaw"
+    / "BAZL"
+    / "DRACONIAN" 
+    / "Dymos"
+    / "Acoustics"
+    / "Neaptide_data"
+    / "TarotX6_B2"
+)
+
+
+def log(message: str) -> None:
+    print(message, flush=True)
+
+
+def microphone_number(path: Path) -> int:
+    match = re.search(r"_(\d+)\.wav$", path.name, flags=re.IGNORECASE)
+    return int(match.group(1)) if match else -1
+
+
+def read_neaptide_wav(
+    path: Path,
+    scale_factor: float = 20.0,
+) -> tuple[int, np.ndarray]:
+    fs, raw = wavfile.read(path)
+
+    if raw.ndim == 2:
+        raw_float = raw.astype(np.float64).mean(axis=1)
+    else:
+        raw_float = raw.astype(np.float64)
+
+    pressure_uPa = raw_float / scale_factor
+    pressure_uPa -= float(np.mean(pressure_uPa))
+
+    if not bool(np.all(np.isfinite(pressure_uPa))):
+        raise ValueError(f"Valori non finiti nel file {path}")
+
+    return int(fs), pressure_uPa
+
+
+def overall_spl_db(pressure_uPa: np.ndarray) -> float:
+    mean_square = float(np.mean(pressure_uPa * pressure_uPa))
+    if mean_square <= 0.0:
+        return float("-inf")
+
+    rms = math.sqrt(mean_square)
+    return 20.0 * math.log10(rms / P0_UPA)
+
+
+def welch_psd_numpy(
+    signal: np.ndarray,
+    fs: int,
+    nperseg: int,
+    overlap_fraction: float = 0.75,
+) -> tuple[np.ndarray, np.ndarray]:
+    x = np.asarray(signal, dtype=np.float64)
+
+    if x.ndim != 1:
+        raise ValueError("Il segnale deve essere monodimensionale.")
+
+    nperseg = min(max(256, int(nperseg)), len(x))
+    noverlap = min(
+        max(0, int(round(overlap_fraction * nperseg))),
+        nperseg - 1,
+    )
+    step = nperseg - noverlap
+    nfft = nperseg
+
+    window = np.hanning(nperseg)
+    window_power = float(np.sum(window * window))
+
+    starts = range(0, len(x) - nperseg + 1, step)
+    psd_sum = np.zeros(nfft // 2 + 1, dtype=np.float64)
+    segment_count = 0
+
+    for start in starts:
+        segment = np.array(x[start : start + nperseg], dtype=np.float64, copy=True)
+        segment -= float(np.mean(segment))
+        segment *= window
+
+        spectrum = np.fft.rfft(segment, n=nfft)
+        real_part = spectrum.real
+        imag_part = spectrum.imag
+        psd = (real_part * real_part + imag_part * imag_part) / (
+            fs * window_power
+        )
+
+        if nfft % 2 == 0:
+            psd[1:-1] *= 2.0
+        else:
+            psd[1:] *= 2.0
+
+        psd_sum += psd
+        segment_count += 1
+
+    if segment_count == 0:
+        raise RuntimeError("Nessun segmento disponibile per Welch.")
+
+    mean_psd = psd_sum / float(segment_count)
+    frequency = np.fft.rfftfreq(nfft, d=1.0 / fs)
+
+    return frequency, mean_psd
+
+
+def stft_psd_numpy(
+    signal: np.ndarray,
+    fs: int,
+    nperseg: int = 4096,
+    overlap_fraction: float = 0.75,
+    nfft: int = 16384,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    x = np.asarray(signal, dtype=np.float64)
+    nperseg = min(max(256, int(nperseg)), len(x))
+    nfft = max(int(nfft), nperseg)
+
+    noverlap = min(
+        max(0, int(round(overlap_fraction * nperseg))),
+        nperseg - 1,
+    )
+    step = nperseg - noverlap
+
+    window = np.hanning(nperseg)
+    window_power = float(np.sum(window * window))
+
+    starts = list(range(0, len(x) - nperseg + 1, step))
+    if not starts:
+        starts = [0]
+
+    matrix = np.empty((nfft // 2 + 1, len(starts)), dtype=np.float64)
+    times = np.empty(len(starts), dtype=np.float64)
+
+    for column, start in enumerate(starts):
+        segment = np.array(x[start : start + nperseg], dtype=np.float64, copy=True)
+
+        if len(segment) < nperseg:
+            padded = np.zeros(nperseg, dtype=np.float64)
+            padded[: len(segment)] = segment
+            segment = padded
+
+        segment -= float(np.mean(segment))
+        segment *= window
+
+        spectrum = np.fft.rfft(segment, n=nfft)
+        psd = (
+            spectrum.real * spectrum.real + spectrum.imag * spectrum.imag
+        ) / (fs * window_power)
+
+        if nfft % 2 == 0:
+            psd[1:-1] *= 2.0
+        else:
+            psd[1:] *= 2.0
+
+        matrix[:, column] = psd
+        times[column] = (start + nperseg / 2.0) / fs
+
+    frequency = np.fft.rfftfreq(nfft, d=1.0 / fs)
+    return frequency, times, matrix
+
+
+def psd_level_db(psd: np.ndarray) -> np.ndarray:
+    safe_psd = np.maximum(np.asarray(psd, dtype=np.float64), 1e-30)
+    return 10.0 * np.log10(safe_psd / (P0_UPA * P0_UPA))
+
+
+def estimate_comb_frequency(
+    frequency: np.ndarray,
+    psd: np.ndarray,
+    search_min_hz: float = 80.0,
+    search_max_hz: float = 110.0,
+    max_order: int = 8,
+) -> float:
+    best_candidate = search_min_hz
+    best_score = float("-inf")
+
+    candidate = search_min_hz
+    while candidate <= search_max_hz + 1e-12:
+        score = 0.0
+
+        for order in range(1, max_order + 1):
+            expected = order * candidate
+            half_width = max(2.5, 0.015 * expected)
+
+            left = int(np.searchsorted(frequency, expected - half_width, side="left"))
+            right = int(np.searchsorted(frequency, expected + half_width, side="right"))
+
+            if right > left:
+                local_max = float(np.max(psd[left:right]))
+                score += local_max / math.sqrt(order)
+
+        if score > best_score:
+            best_score = score
+            best_candidate = candidate
+
+        candidate += 0.05
+
+    return float(best_candidate)
+
+
+def safe_median(values: np.ndarray) -> float:
+    if values.size == 0:
+        return float("nan")
+
+    # statistics.median evita il percorso interno di np.median.
+    return float(statistics.median(values.astype(float).tolist()))
+
+
+def extract_harmonics_safe(
+    frequency: np.ndarray,
+    psd: np.ndarray,
+    base_frequency_hz: float,
+    max_order: int,
+    microphone: int | str,
+    manoeuvre: str,
+) -> list[dict[str, Any]]:
+    """
+    Estrae un massimo in ciascuna banda armonica.
+
+    Restituisce una lista di dizionari e non crea DataFrame.
+    """
+    levels = psd_level_db(psd)
+    rows: list[dict[str, Any]] = []
+
+    for order in range(1, max_order + 1):
+        log(
+            f"[{manoeuvre}] armoniche – mic {microphone}, "
+            f"ordine {order}/{max_order}"
+        )
+
+        expected = float(order * base_frequency_hz)
+        half_width = float(max(5.0, 0.045 * expected))
+
+        left = int(
+            np.searchsorted(
+                frequency,
+                expected - half_width,
+                side="left",
+            )
+        )
+        right = int(
+            np.searchsorted(
+                frequency,
+                expected + half_width,
+                side="right",
+            )
+        )
+
+        if right <= left:
+            continue
+
+        local_levels = levels[left:right]
+        local_peak_offset = int(np.argmax(local_levels))
+        peak_index = left + local_peak_offset
+
+        measured = float(frequency[peak_index])
+        peak_level = float(levels[peak_index])
+
+        broad_half_width = 1.8 * half_width
+        broad_left = int(
+            np.searchsorted(
+                frequency,
+                expected - broad_half_width,
+                side="left",
+            )
+        )
+        broad_right = int(
+            np.searchsorted(
+                frequency,
+                expected + broad_half_width,
+                side="right",
+            )
+        )
+
+        exclusion_width = float(max(3.0, 0.012 * expected))
+        exclusion_left = int(
+            np.searchsorted(
+                frequency,
+                measured - exclusion_width,
+                side="left",
+            )
+        )
+        exclusion_right = int(
+            np.searchsorted(
+                frequency,
+                measured + exclusion_width,
+                side="right",
+            )
+        )
+
+        floor_parts: list[np.ndarray] = []
+
+        if exclusion_left > broad_left:
+            floor_parts.append(levels[broad_left:exclusion_left])
+
+        if broad_right > exclusion_right:
+            floor_parts.append(levels[exclusion_right:broad_right])
+
+        if floor_parts:
+            floor_values = np.concatenate(floor_parts)
+            local_floor = safe_median(floor_values)
+        else:
+            local_floor = float("nan")
+
+        prominence = (
+            peak_level - local_floor
+            if math.isfinite(local_floor)
+            else float("nan")
+        )
+
+        rows.append(
+            {
+                "manovra": manoeuvre,
+                "microfono": microphone,
+                "ordine": order,
+                "frequenza_base_Hz": base_frequency_hz,
+                "frequenza_attesa_Hz": expected,
+                "frequenza_picco_Hz": measured,
+                "errore_Hz": measured - expected,
+                "livello_picco_dB_re_20uPa2_Hz": peak_level,
+                "fondo_locale_dB_re_20uPa2_Hz": local_floor,
+                "prominenza_tonale_dB": prominence,
+            }
+        )
+
+    return rows
+
+
+def fit_harmonic_decay_safe(
+    rows: list[dict[str, Any]],
+    minimum_prominence_db: float = 6.0,
+) -> tuple[float, float, float, int]:
+    valid = [
+        row
+        for row in rows
+        if math.isfinite(float(row["livello_picco_dB_re_20uPa2_Hz"]))
+        and math.isfinite(float(row["prominenza_tonale_dB"]))
+        and float(row["prominenza_tonale_dB"]) >= minimum_prominence_db
+    ]
+
+    if len(valid) < 3:
+        valid = [
+            row
+            for row in rows
+            if math.isfinite(float(row["livello_picco_dB_re_20uPa2_Hz"]))
+        ]
+
+    if len(valid) < 2:
+        return float("nan"), float("nan"), float("nan"), len(valid)
+
+    x = [float(row["ordine"]) for row in valid]
+    y = [float(row["livello_picco_dB_re_20uPa2_Hz"]) for row in valid]
+
+    x_mean = sum(x) / len(x)
+    y_mean = sum(y) / len(y)
+
+    denominator = sum((value - x_mean) ** 2 for value in x)
+
+    if denominator <= 0.0:
+        return float("nan"), float("nan"), float("nan"), len(valid)
+
+    numerator = sum(
+        (x_value - x_mean) * (y_value - y_mean)
+        for x_value, y_value in zip(x, y)
+    )
+
+    slope = numerator / denominator
+    intercept = y_mean - slope * x_mean
+
+    predictions = [intercept + slope * value for value in x]
+    residual_sum = sum(
+        (observed - predicted) ** 2
+        for observed, predicted in zip(y, predictions)
+    )
+    total_sum = sum((observed - y_mean) ** 2 for observed in y)
+
+    r_squared = (
+        1.0 - residual_sum / total_sum
+        if total_sum > 0.0
+        else float("nan")
+    )
+
+    return slope, intercept, r_squared, len(valid)
+
+
+def write_rows_csv(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        path.write_text("", encoding="utf-8")
+        return
+
+    fieldnames = list(rows[0].keys())
+
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_spectrum_csv(
+    path: Path,
+    frequency: np.ndarray,
+    mean_psd: np.ndarray,
+) -> None:
+    levels = psd_level_db(mean_psd)
+
+    with path.open("w", newline="", encoding="utf-8-sig") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(
+            [
+                "frequenza_Hz",
+                "PSD_media_uPa2_Hz",
+                "livello_PSD_medio_dB_re_20uPa2_Hz",
+            ]
+        )
+
+        for frequency_value, psd_value, level_value in zip(
+            frequency,
+            mean_psd,
+            levels,
+        ):
+            writer.writerow(
+                [
+                    float(frequency_value),
+                    float(psd_value),
+                    float(level_value),
+                ]
+            )
+
+
+def save_spectrum_plot(
+    frequency: np.ndarray,
+    individual_psd: list[np.ndarray],
+    labels: list[str],
+    mean_psd: np.ndarray,
+    base_frequency_hz: float,
+    max_order: int,
+    title: str,
+    output_path: Path,
+    max_frequency_hz: float = 1500.0,
+) -> None:
+    left = int(np.searchsorted(frequency, 20.0, side="left"))
+    right = int(
+        np.searchsorted(
+            frequency,
+            max_frequency_hz,
+            side="right",
+        )
+    )
+
+    plt.figure(figsize=(11, 6))
+
+    for spectrum, label in zip(individual_psd, labels):
+        plt.plot(
+            frequency[left:right],
+            psd_level_db(spectrum[left:right]),
+            linewidth=0.7,
+            alpha=0.42,
+            label=label,
+        )
+
+    plt.plot(
+        frequency[left:right],
+        psd_level_db(mean_psd[left:right]),
+        linewidth=1.8,
+        label="Media lineare dei microfoni",
+    )
+
+    for order in range(1, max_order + 1):
+        harmonic = order * base_frequency_hz
+        if harmonic > max_frequency_hz:
+            break
+        plt.axvline(harmonic, linewidth=0.7, alpha=0.28)
+
+    plt.xlabel("Frequenza [Hz]")
+    plt.ylabel("PSD [dB re 20 µPa²/Hz]")
+    plt.title(title)
+    plt.grid(True, alpha=0.25)
+    plt.legend(ncol=2, fontsize=8)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
+def save_decay_plot(
+    rows: list[dict[str, Any]],
+    slope: float,
+    intercept: float,
+    r_squared: float,
+    title: str,
+    output_path: Path,
+) -> None:
+    orders = [float(row["ordine"]) for row in rows]
+    levels = [
+        float(row["livello_picco_dB_re_20uPa2_Hz"])
+        for row in rows
+    ]
+
+    plt.figure(figsize=(8, 5.5))
+    plt.scatter(orders, levels, label="Picchi misurati")
+
+    if (
+        orders
+        and math.isfinite(slope)
+        and math.isfinite(intercept)
+    ):
+        x_min = min(orders)
+        x_max = max(orders)
+        x_line = np.linspace(x_min, x_max, 100)
+        y_line = intercept + slope * x_line
+
+        plt.plot(
+            x_line,
+            y_line,
+            label=(
+                f"Fit: {slope:.2f} dB/ordine, "
+                f"R²={r_squared:.3f}"
+            ),
+        )
+
+    plt.xlabel("Ordine armonico")
+    plt.ylabel("Livello del picco [dB re 20 µPa²/Hz]")
+    plt.title(title)
+    plt.grid(True, alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
+def save_spectrogram(
+    pressure_uPa: np.ndarray,
+    fs: int,
+    title: str,
+    output_path: Path,
+    max_frequency_hz: float = 1500.0,
+) -> None:
+    frequency, time, psd_matrix = stft_psd_numpy(
+        pressure_uPa,
+        fs,
+        nperseg=4096,
+        overlap_fraction=0.75,
+        nfft=16384,
+    )
+
+    left = int(np.searchsorted(frequency, 20.0, side="left"))
+    right = int(
+        np.searchsorted(
+            frequency,
+            max_frequency_hz,
+            side="right",
+        )
+    )
+
+    levels = psd_level_db(psd_matrix[left:right, :])
+
+    vmax = float(np.percentile(levels, 99.5))
+    vmin = vmax - 55.0
+
+    plt.figure(figsize=(11, 6))
+    mesh = plt.pcolormesh(
+        time,
+        frequency[left:right],
+        levels,
+        shading="auto",
+        vmin=vmin,
+        vmax=vmax,
+    )
+    plt.colorbar(mesh, label="PSD [dB re 20 µPa²/Hz]")
+    plt.xlabel("Tempo [s]")
+    plt.ylabel("Frequenza [Hz]")
+    plt.title(title)
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=180)
+    plt.close()
+
+
+def analyse_group(
+    files: list[Path],
+    output_dir: Path,
+    label: str,
+    scale_factor: float,
+    requested_base_frequency: float | None,
+    max_order: int,
+) -> dict[str, Any] | None:
+    if not files:
+        log(f"[{label}] Nessun file trovato.")
+        return None
+
+    log(f"[{label}] Funzione avviata con {len(files)} file.")
+
+    files = sorted(files, key=microphone_number)
+    spectra: list[np.ndarray] = []
+    labels: list[str] = []
+    file_rows: list[dict[str, Any]] = []
+    loaded_signals: list[tuple[Path, int, np.ndarray]] = []
+    frequency_reference: np.ndarray | None = None
+
+    nperseg = 65536 if label.lower() == "hover" else 16384
+
+    for index, path in enumerate(files, start=1):
+        log(f"[{label}] {index}/{len(files)} – lettura {path.name}")
+
+        fs, pressure_uPa = read_neaptide_wav(
+            path,
+            scale_factor=scale_factor,
+        )
+
+        duration = len(pressure_uPa) / fs
+        spl = overall_spl_db(pressure_uPa)
+
+        log(
+            f"[{label}] fs={fs} Hz, durata={duration:.3f} s, "
+            f"SPL={spl:.2f} dB. Calcolo Welch..."
+        )
+
+        frequency, psd = welch_psd_numpy(
+            pressure_uPa,
+            fs,
+            nperseg=nperseg,
+            overlap_fraction=0.75,
+        )
+
+        if frequency_reference is None:
+            frequency_reference = frequency
+        elif not np.array_equal(frequency_reference, frequency):
+            psd = np.interp(frequency_reference, frequency, psd)
+
+        spectra.append(psd)
+        mic = microphone_number(path)
+        labels.append(f"Mic {mic}")
+        loaded_signals.append((path, fs, pressure_uPa))
+
+        file_rows.append(
+            {
+                "manovra": label,
+                "microfono": mic,
+                "file": path.name,
+                "sample_rate_Hz": fs,
+                "durata_s": duration,
+                "SPL_RMS_dB_re_20uPa": spl,
+            }
+        )
+
+        log(f"[{label}] Welch completata per {path.name}.")
+
+    if frequency_reference is None or not spectra:
+        raise RuntimeError(f"[{label}] Nessuno spettro disponibile.")
+
+    # Media incrementale, senza vstack.
+    mean_psd = np.zeros_like(spectra[0])
+
+    for spectrum in spectra:
+        mean_psd += spectrum
+
+    mean_psd /= float(len(spectra))
+
+    if requested_base_frequency is None:
+        base_frequency_hz = estimate_comb_frequency(
+            frequency_reference,
+            mean_psd,
+            search_min_hz=80.0,
+            search_max_hz=110.0,
+            max_order=max_order,
+        )
+        log(
+            f"[{label}] Frequenza acustica di base stimata: "
+            f"{base_frequency_hz:.2f} Hz"
+        )
+    else:
+        base_frequency_hz = float(requested_base_frequency)
+        log(
+            f"[{label}] Frequenza acustica di base imposta: "
+            f"{base_frequency_hz:.2f} Hz"
+        )
+
+    # Salva subito le informazioni dei file.
+    write_rows_csv(
+        output_dir / f"{label.lower()}_file_info.csv",
+        file_rows,
+    )
+    log(f"[{label}] Salvato file_info.csv")
+
+    log(f"[{label}] Estrazione armoniche della media...")
+    average_rows = extract_harmonics_safe(
+        frequency_reference,
+        mean_psd,
+        base_frequency_hz,
+        max_order,
+        microphone="media",
+        manoeuvre=label,
+    )
+
+    write_rows_csv(
+        output_dir / f"{label.lower()}_harmonics_average.csv",
+        average_rows,
+    )
+    log(f"[{label}] Salvate armoniche medie.")
+
+    all_rows = list(average_rows)
+
+    for index, (path, spectrum) in enumerate(
+        zip(files, spectra),
+        start=1,
+    ):
+        mic = microphone_number(path)
+        log(
+            f"[{label}] Estrazione armoniche microfono "
+            f"{mic} ({index}/{len(files)})..."
+        )
+
+        microphone_rows = extract_harmonics_safe(
+            frequency_reference,
+            spectrum,
+            base_frequency_hz,
+            max_order,
+            microphone=mic,
+            manoeuvre=label,
+        )
+        all_rows.extend(microphone_rows)
+
+        # Checkpoint aggiornato a ogni microfono.
+        write_rows_csv(
+            output_dir
+            / f"{label.lower()}_harmonics_all_microphones.csv",
+            all_rows,
+        )
+
+    log(f"[{label}] Tutte le armoniche sono state estratte.")
+
+    slope, intercept, r_squared, fit_points = (
+        fit_harmonic_decay_safe(average_rows)
+    )
+
+    log(
+        f"[{label}] Fit completato: "
+        f"{slope:.3f} dB/ordine, R²={r_squared:.3f}"
+    )
+
+    write_spectrum_csv(
+        output_dir / f"{label.lower()}_mean_spectrum.csv",
+        frequency_reference,
+        mean_psd,
+    )
+    log(f"[{label}] Salvato spettro medio CSV.")
+
+    summary = {
+        "manovra": label,
+        "numero_file": len(files),
+        "frequenza_base_acustica_Hz": base_frequency_hz,
+        "pendenza_decadimento_dB_per_ordine": slope,
+        "intercetta_fit_dB": intercept,
+        "R2_fit_lineare_in_dB": r_squared,
+        "numero_punti_fit": fit_points,
+        "SPL_medio_microfoni_dB_re_20uPa": (
+            sum(
+                float(row["SPL_RMS_dB_re_20uPa"])
+                for row in file_rows
+            )
+            / len(file_rows)
+        ),
+    }
+
+    write_rows_csv(
+        output_dir / f"{label.lower()}_summary.csv",
+        [summary],
+    )
+    log(f"[{label}] Salvato summary.csv.")
+
+    log(f"[{label}] Creazione dello spettro medio PNG...")
+    save_spectrum_plot(
+        frequency_reference,
+        spectra,
+        labels,
+        mean_psd,
+        base_frequency_hz,
+        max_order,
+        title=(
+            f"DJI Matrice 300 RTK – {label} – "
+            f"spettro medio Welch"
+        ),
+        output_path=(
+            output_dir / f"{label.lower()}_mean_spectrum.png"
+        ),
+    )
+    log(f"[{label}] Salvato spettro medio PNG.")
+
+    log(f"[{label}] Creazione del grafico di decadimento...")
+    save_decay_plot(
+        average_rows,
+        slope,
+        intercept,
+        r_squared,
+        title=(
+            f"DJI Matrice 300 RTK – {label} – "
+            f"decadimento armonico"
+        ),
+        output_path=(
+            output_dir / f"{label.lower()}_harmonic_decay.png"
+        ),
+    )
+    log(f"[{label}] Salvato grafico di decadimento.")
+
+    if label.lower() == "lateral":
+        for index, (path, fs, pressure_uPa) in enumerate(
+            loaded_signals,
+            start=1,
+        ):
+            mic = microphone_number(path)
+
+            log(
+                f"[{label}] Spettrogramma microfono {mic} "
+                f"({index}/{len(loaded_signals)})..."
+            )
+
+            save_spectrogram(
+                pressure_uPa,
+                fs,
+                title=(
+                    f"DJI Matrice 300 RTK – Lateral – "
+                    f"microfono {mic}"
+                ),
+                output_path=(
+                    output_dir
+                    / f"lateral_mic{mic}_spectrogram.png"
+                ),
+            )
+
+    log(f"[{label}] Analisi completata.")
+    return summary
+
+def plot_all_welch(directory, nperseg=None):
+
+    wav_files = sorted(directory.glob("*.wav"))
+
+    plt.figure(figsize=(10,6))
+
+    for wav in wav_files:
+
+        fs, signal = read_neaptide_wav(wav)
+
+        print(f"Duration = {len(signal)/fs:.1f} s")
+
+        duration = len(signal) / fs
+
+        t_start = 1.0 #duration/2 - 1
+        t_end   = 9.0 # duration/2 + 1
+
+        signal = signal[int(t_start*fs):int(t_end*fs)]
+
+        if nperseg is None:
+            nperseg = fs
+
+        f, psd = welch_psd_numpy(signal, fs, nperseg)
+
+        spl = 10*np.log10(psd / 20.0**2)
+
+        plt.plot(f, spl, label=wav.stem)
+        plt.xscale("log")
+
+    plt.xlabel("Frequency [Hz]")
+    plt.ylabel("PSD Level [dB re 20 µPa²/Hz]")
+    plt.grid(True)
+    plt.legend()
+
+    plt.show()
+
+    # fig, axes = plt.subplots(
+    #     len(wav_files),
+    #     1,
+    #     figsize=(12, 2.8*len(wav_files)),
+    #     sharex=True,
+    #     constrained_layout=True,
+    # )
+
+    fig, axes = plt.subplots(
+        1,
+        len(wav_files),
+        figsize=(3*len(wav_files), 5),
+        sharey=True,
+    )
+
+    # Handle the case of only one file
+    if len(wav_files) == 1:
+        axes = [axes]
+
+    for ax, wav in zip(axes, wav_files):
+
+        fs, signal = read_neaptide_wav(wav)
+
+        print(f"{wav.name}: Duration = {len(signal)/fs:.1f} s")
+
+        t_start = 0.0
+        t_end = 10.0
+
+        signal = signal[int(t_start*fs):int(t_end*fs)]
+
+        f, t, Sxx = scipy_signal.spectrogram(
+            signal,
+            fs,
+            window="hann",
+            nperseg=4096,
+            noverlap=3072,
+            scaling="density",
+        )
+
+        # im = ax.pcolormesh(
+        #     t,
+        #     f,
+        #     10*np.log10(np.maximum(Sxx, 1e-30)),
+        #     shading="gouraud",
+        #     vmin=-80,
+        #     vmax=-20,
+        # )
+        im = ax.pcolormesh(
+            t,
+            f,
+            10*np.log10(np.maximum(Sxx, 1e-30)),
+            shading="gouraud",
+            vmin=+20,
+            vmax=+100,
+        )
+
+        ax.set_yscale("log")
+        ax.set_ylim(20, 20000)
+
+        ax.set_ylabel("Frequency [Hz]")
+        ax.set_title(wav.stem)
+
+    axes[-1].set_xlabel("Time [s]")
+
+    fig.colorbar(im, ax=axes, label="PSD [dB/Hz]")
+
+    # plt.tight_layout()
+    plt.show()
+
+
+plot_all_welch(DEFAULT_INPUT_DIR)
+
