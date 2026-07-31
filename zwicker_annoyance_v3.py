@@ -330,6 +330,7 @@ def zwicker_annoyance(N: float, S: float, R: float, F) -> float:
     wS = (S - 1.75) * 0.25 * np.log10(N + 10) if S > 1.75 else 0.0
     wFR = (2.18 / N**0.4) * (0.4 * F + 0.6 * R)
     PA = N * (1 + np.sqrt(wS**2 + wFR**2))
+    # print(wS,wFR)
     return float(PA)
 
 

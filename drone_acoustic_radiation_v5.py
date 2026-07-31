@@ -104,28 +104,29 @@ def power_to_pressure_amplitude(p_acoustic: np.ndarray, r: np.ndarray, theta_rad
     """
     p_acoustic = np.asarray(p_acoustic, dtype=float)
     r = np.clip(np.asarray(r, dtype=float), 1e-3, None)
-    D = directivity_factor(np.asarray(theta_rad, dtype=float))
-    intensity = p_acoustic * D / (4.0 * np.pi * r**2)
+    # D = directivity_factor(np.asarray(theta_rad, dtype=float))
+    # intensity = p_acoustic * D / (4.0 * np.pi * r**2)
+    intensity = p_acoustic / (4.0 * np.pi * r**2)
     p_rms = np.sqrt(np.clip(intensity, 0.0, None) * params.rho * params.c_sound)
     return np.sqrt(2.0) * p_rms
 
-def directivity_factor(theta_rad: np.ndarray, w: float = 0.25) -> np.ndarray:
-    """
-    Combined loading & thickness directivity model, normalized to 1.
+# def directivity_factor(theta_rad: np.ndarray, w: float = 0.25) -> np.ndarray:
+#     """
+#     Combined loading & thickness directivity model, normalized to 1.
     
-    Parameters
-    ----------
-    theta_rad : np.ndarray
-        Angle measured from the rotor thrust axis (rad).
-    w : float
-        Weight parameter [0, 1]. Reflects the proportion of loading noise
-        versus thickness/coplanar noise. (Default of 0.25 is typical for drones).
-    """
-    # Ensure w is clipped between 0 and 1
-    w = np.clip(w, 0.0, 1.0)
+#     Parameters
+#     ----------
+#     theta_rad : np.ndarray
+#         Angle measured from the rotor thrust axis (rad).
+#     w : float
+#         Weight parameter [0, 1]. Reflects the proportion of loading noise
+#         versus thickness/coplanar noise. (Default of 0.25 is typical for drones).
+#     """
+#     # Ensure w is clipped between 0 and 1
+#     w = np.clip(w, 0.0, 1.0)
     
-    # 3*cos^2(theta) and 1.5*sin^2(theta) both integrate to 1 over the sphere
-    return w * 3.0 * (np.cos(theta_rad) ** 2) + (1.0 - w) * 1.5 * (np.sin(theta_rad) ** 2)
+#     # 3*cos^2(theta) and 1.5*sin^2(theta) both integrate to 1 over the sphere
+#     return w * 3.0 * (np.cos(theta_rad) ** 2) + (1.0 - w) * 1.5 * (np.sin(theta_rad) ** 2)
 
 # def directivity_factor(theta_rad: np.ndarray) -> np.ndarray:
 #     """
@@ -283,10 +284,11 @@ def calibrate_p_ref(spl_ref_db: float, rpm_ref_measurement: float, r_ref: float,
         AcousticParams.rpm_ref = rpm_ref_measurement.
     """
     theta_ref = np.radians(theta_ref_deg)
-    D_ref = directivity_factor(theta_ref)
+    # D_ref = directivity_factor(theta_ref)
 
     # invert SPL = SWL + 10log10(D) - 20log10(r) - 11
-    swl_ref_db = spl_ref_db - 10.0 * np.log10(D_ref) + 20.0 * np.log10(r_ref) + 11.0
+    # swl_ref_db = spl_ref_db - 10.0 * np.log10(D_ref) + 20.0 * np.log10(r_ref) + 11.0
+    swl_ref_db = spl_ref_db + 20.0 * np.log10(r_ref) + 11.0
     p_total_ref = 1e-12 * 10.0 ** (swl_ref_db / 10.0)
     p_ref_single_rotor = p_total_ref / n_rotors_in_measurement
     return p_ref_single_rotor
@@ -510,7 +512,7 @@ def load_directivity_model(path=input_path):
     return harmonic_directivity_smooth
 
 
-harmonic_directivity_smooth = load_directivity_model("directivity_model_pchip.npz")
+harmonic_directivity_smooth = load_directivity_model(input_path)
 
 def generate_rotor_azimuth_with_harmonics(rpm_fine, t_fine, r, theta_rad,
                                            acoustic_params, fine_params=None, rng=None,
@@ -548,6 +550,7 @@ def generate_rotor_azimuth_with_harmonics(rpm_fine, t_fine, r, theta_rad,
 
         p_peak_n = p_peak_fundamental * amp_ratio
         p_rotor += p_peak_n * np.sin(n * (phase + disturbance))
+        print(n,amp_ratio)
 
     return p_rotor, phase, disturbance
 
@@ -623,7 +626,7 @@ def estimate_received_spl_fine(t, x, y, z,
                                 z_up: bool = True,
                                 include_broadband: bool = True,
                                 bb_f_peak: float = 2500.0,
-                                bb_amp_factor: float = 10.0) -> dict:
+                                bb_amp_factor: float = 0.1) -> dict:
     """
     Fine-time-grid version of estimate_received_spl(): upsamples the coarse
     Dymos time history to a fine grid (suitable for downstream

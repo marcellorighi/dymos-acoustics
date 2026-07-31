@@ -88,7 +88,9 @@ def plot_acoustic_spectrum(spectrum_data, max_freq_display=5000.0):
     plt.xlabel('Frequency [Hz]', fontsize=10)
     plt.ylabel('Sound Pressure Level [dB SPL]', fontsize=10)
     plt.grid(True, which="both", linestyle=':', alpha=0.5)
-    plt.xlim(0, max_freq_display)
+    # plt.xlim(0, max_freq_display)
+    plt.xscale("log")
+    plt.xlim(20, max_freq_display)   # lower bound must be > 0
     
     # Find and label the absolute loudest peak (likely the dominant BPF)
     peak_idx = np.argmax(spl_db[mask])
@@ -540,7 +542,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
     
     # Model Calibration
     p_ref = calibrate_p_ref(
-        spl_ref_db=92.0, rpm_ref_measurement=5000.0, # 72 db 
+        spl_ref_db=60.0, rpm_ref_measurement=5000.0, # 72 db 
         r_ref=5.0, theta_ref_deg=90.0,
         n_rotors_in_measurement=4, n_exponent=5.0,
     )
@@ -551,7 +553,7 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         disturbance_amplitude_rad=0.05, disturbance_bandwidth_hz=20.0, random_seed=42,
     )
 
-    observer_xyz = (5.0, 0.0, 0.0)
+    observer_xyz = (0.0, 0.0, 0.0)
 
     # Compute Received SPL
     spl_fine = estimate_received_spl_fine(
@@ -561,11 +563,16 @@ def run_drone_acoustic_simulation(gains_vector, dryden_ts, velocity_schedule, ti
         observer_xyz, acoustic_params=acoustic_params, fine_params=fine_params,
     )
     
+    print("SPL fine computed!")
+
     pa = compute_zwicker_indicators_windowed(
         spl_fine["p_signal"], fs=fine_params.fs,
         window_s=2.0, hop_s=0.5,
         use_fs_approximation=True,
     )
+
+    print("Indicators computed")
+
     # Return metrics you want to evaluate or optimize (e.g. mean SPL or max SPL)
     return spl_fine, pa, rpm_result, history_state, history_controls, history_accel, history_gusts
 
@@ -837,7 +844,7 @@ def evaluate_drone_codesign(X, initial_state, dt, t_end, debug=False, mode='clim
             v_ref=5.0, z_ref=20.0,
         ),
         seed=42,
-        altitude=50.0,
+        altitude=25.0,
     )
 
     waypoints, time_steps, v_x_ref, v_y_ref, v_z_ref = generate_dynamic_trajectory(
@@ -864,6 +871,8 @@ def evaluate_drone_codesign(X, initial_state, dt, t_end, debug=False, mode='clim
         )
         spl_fine, pa, rpm_results, hist_state, _, _, _ = outputs
         
+        print("Simulation complete!")
+
         # 💡 Fixed: mode=mode ensures hover/fly_by logic scales correctly
         total_objective, acoustic_cost, itae_penalty, slowness_penalty, efficiency_cost = calculate_optimization_objective(hist_state, v_x_ref, v_y_ref, v_z_ref, pa, rpm_results, time_steps, mode='climb_cruise')
                 
@@ -1139,14 +1148,14 @@ class ParametricDronePlant:
 if __name__ == "__main__":
 
     dt = 0.002 
-    t_end = 12.01
+    t_end = 14.01
     vz_max = 5.0 
     vx_max = 5.00 
     vy_max = 0. 
     t_climb = 3.0
 
     # Define our new explicit optimization/test parameters
-    motor_bandwidth_hz = 10.0 
+    motor_bandwidth_hz = 10.0 # Hz 
     test_ki_vel = 0.04  # Explicitly setting the velocity integrator gain
 
     
@@ -1180,6 +1189,7 @@ if __name__ == "__main__":
     test_X, initial_state=my_init_state, dt=dt, t_end=t_end, debug=True, mode='hover'
     )
     # hover - climb_cruise - fly_by
+    print("evaluate drone codesign")
        
     # 3. Execute your new Frequency Domain Debugger!
     spectrum = compute_acoustic_spectrum_debug(spl_fine)

@@ -119,15 +119,15 @@ def overall_spl_db(pressure_uPa: np.ndarray) -> float:
     rms = math.sqrt(mean_square)
     return 20.0 * math.log10(rms / P0_UPA)
 
-
 def welch_psd_numpy(
     signal: np.ndarray,
     fs: int,
     nperseg: int,
     overlap_fraction: float = 0.75,
-) -> tuple[np.ndarray, np.ndarray]:
+    pref: float = 20e-6,
+    psd_floor: float = 1e-30,
+) -> dict:
     x = np.asarray(signal, dtype=np.float64)
-
     if x.ndim != 1:
         raise ValueError("Il segnale deve essere monodimensionale.")
 
@@ -154,9 +154,7 @@ def welch_psd_numpy(
         spectrum = np.fft.rfft(segment, n=nfft)
         real_part = spectrum.real
         imag_part = spectrum.imag
-        psd = (real_part * real_part + imag_part * imag_part) / (
-            fs * window_power
-        )
+        psd = (real_part * real_part + imag_part * imag_part) / (fs * window_power)
 
         if nfft % 2 == 0:
             psd[1:-1] *= 2.0
@@ -167,12 +165,80 @@ def welch_psd_numpy(
         segment_count += 1
 
     if segment_count == 0:
-        raise RuntimeError("Nessun segmento disponibile per Welch.")
+        raise RuntimeError("No segments available for Welch.")
 
     mean_psd = psd_sum / float(segment_count)
     frequency = np.fft.rfftfreq(nfft, d=1.0 / fs)
 
-    return frequency, mean_psd
+    # --- PSD level, dB re pref^2/Hz (per-bin spectral density level,
+    #     NOT a true SPL -- see note below) ---
+    spl = 10 * np.log10(np.maximum(mean_psd, psd_floor) / pref**2)
+
+    # --- Overall broadband sound level, dB re pref, from integrating
+    #     the PSD across the full frequency range analyzed ---
+    p_meansq = np.trapezoid(mean_psd, frequency)
+    overall_level_db = 10 * np.log10(max(p_meansq, psd_floor) / pref**2)
+
+    return {
+        "freq": frequency,
+        "psd": mean_psd,
+        "spl": spl,
+        "overall_level_db": overall_level_db,
+    }
+
+# def welch_psd_numpy(
+#     signal: np.ndarray,
+#     fs: int,
+#     nperseg: int,
+#     overlap_fraction: float = 0.75,
+# ) -> tuple[np.ndarray, np.ndarray]:
+#     x = np.asarray(signal, dtype=np.float64)
+
+#     if x.ndim != 1:
+#         raise ValueError("Il segnale deve essere monodimensionale.")
+
+#     nperseg = min(max(256, int(nperseg)), len(x))
+#     noverlap = min(
+#         max(0, int(round(overlap_fraction * nperseg))),
+#         nperseg - 1,
+#     )
+#     step = nperseg - noverlap
+#     nfft = nperseg
+
+#     window = np.hanning(nperseg)
+#     window_power = float(np.sum(window * window))
+
+#     starts = range(0, len(x) - nperseg + 1, step)
+#     psd_sum = np.zeros(nfft // 2 + 1, dtype=np.float64)
+#     segment_count = 0
+
+#     for start in starts:
+#         segment = np.array(x[start : start + nperseg], dtype=np.float64, copy=True)
+#         segment -= float(np.mean(segment))
+#         segment *= window
+
+#         spectrum = np.fft.rfft(segment, n=nfft)
+#         real_part = spectrum.real
+#         imag_part = spectrum.imag
+#         psd = (real_part * real_part + imag_part * imag_part) / (
+#             fs * window_power
+#         )
+
+#         if nfft % 2 == 0:
+#             psd[1:-1] *= 2.0
+#         else:
+#             psd[1:] *= 2.0
+
+#         psd_sum += psd
+#         segment_count += 1
+
+#     if segment_count == 0:
+#         raise RuntimeError("Nessun segmento disponibile per Welch.")
+
+#     mean_psd = psd_sum / float(segment_count)
+#     frequency = np.fft.rfftfreq(nfft, d=1.0 / fs)
+
+#     return frequency, mean_psd
 
 
 def stft_psd_numpy(
@@ -1101,11 +1167,51 @@ def integrate_band(freq, psd, f_low, f_high):
     )
 
 
+
+def plot_dashboard(pa, title):
+    active_keys = [k for k in acoustic_metadata.keys() if k in pa]
+    num_plots = len(active_keys)
+
+    fig, axs = plt.subplots(num_plots, 1, figsize=(10, 2.2 * num_plots), sharex=True)
+    if num_plots == 1:
+        axs = [axs]
+
+    for idx, key in enumerate(active_keys):
+        signal = np.asarray(pa[key], dtype=float)
+        t_acoustic = pa["t_center"]
+        is_valid = ~np.isnan(signal)
+        meta = acoustic_metadata[key]
+        if np.any(is_valid):
+            axs[idx].plot(t_acoustic[is_valid], signal[is_valid],
+                          color=meta['color'], linewidth=2, label=meta['label'])
+        else:
+            axs[idx].text(0.5, 0.5, 'Metric Data Unavailable',
+                          transform=axs[idx].transAxes, ha='center', va='center',
+                          color='gray', fontstyle='italic')
+        axs[idx].set_ylabel(meta['label'], fontsize=10, fontweight='bold')
+        axs[idx].grid(True, linestyle=':', alpha=0.5)
+
+    axs[-1].set_xlabel('Time [seconds]', fontsize=11)
+    fig.suptitle(title, fontsize=13, fontweight='bold', y=0.99)
+    plt.tight_layout()
+    plt.show()
+
 Dr = 7.755 
 d = 2.585
 Hr = 7.755
 hs = 0.375
 hi = 3.878
+
+# ----------------------------------------------------
+# Per-signal dashboard (reusing your plotting logic)
+# ----------------------------------------------------
+acoustic_metadata = {
+    'loudness_sone':     {'label': 'Loudness [Sone]',      'color': '#2980B9'},
+    'sharpness_acum':    {'label': 'Sharpness [Acum]',     'color': '#8E44AD'},
+    'roughness_asper':   {'label': 'Roughness [Asper]',    'color': '#16A085'},
+    'fluctuation_vacil': {'label': 'Fluctuation [Vacil]',  'color': '#F39C12'},
+    'annoyance_PA':      {'label': 'Total Annoyance [PA]', 'color': '#D35400'}
+}
 
 x_coord = np.array([
     3*d,
@@ -1162,7 +1268,10 @@ n_f_ref = len(BPF_M_list)
 
 half_width = 12.5  # Hz, the +/- 5 you had
 
+from zwicker_annoyance_v3 import compute_zwicker_indicators_windowed
+
 spectra = {}
+calibration_factor = 5.e-8
 
 for wav in wav_files:
 
@@ -1172,9 +1281,9 @@ for wav in wav_files:
 
     # Optional: select steady-state part
     t_start = 0.5
-    t_end = 2.5
+    t_end = 9.5
 
-    pressure = pressure[
+    pressure = calibration_factor * pressure[
         int(t_start*fs):
         int(t_end*fs)
     ]
@@ -1182,25 +1291,39 @@ for wav in wav_files:
     # Welch PSD
     nperseg = fs  # 1 second segments
 
-    freq, psd = welch_psd_numpy(
+    result = welch_psd_numpy(
         pressure,
         fs,
         nperseg
     )
 
+    freq, psd, spl, overall_db = result["freq"], result["psd"], result["spl"], result["overall_level_db"]
+
     # Convert PSD to SPL spectrum
     pref = 20.0  # µPa
 
-    spl = 10*np.log10(
-        np.maximum(psd, 1e-30) / pref**2
-    )
+    # spl = 10*np.log10(
+    #     np.maximum(psd, 1e-30) / pref**2
+    # )
 
     spectra[wav.stem] = {
         "fs": fs,
         "freq": freq,
         "psd": psd,
         "spl": spl,
+        "overall_db": overall_db,
     }
+
+    # --- Psychoacoustic (Zwicker) indicators, computed on the same
+    #     steady-state time-domain segment used for the PSD above ---
+    # pa = compute_zwicker_indicators_windowed(
+    #     pressure, fs,
+    #     window_s=1.0, hop_s=0.25,
+    #     stationary=True,
+    #     use_fs_approximation=True,
+    # )
+
+    # plot_dashboard(pa, title=wav.stem)
 
 plt.figure(figsize=(10,5))
 
@@ -1208,7 +1331,7 @@ for name, data in spectra.items():
 
     plt.plot(
         data["freq"],
-        data["spl"],
+        data["psd"],
         label=name
     )
 
@@ -1216,12 +1339,14 @@ plt.xscale("log")
 plt.xlim(20,20000)
 
 plt.xlabel("Frequency [Hz]")
-plt.ylabel("PSD level [dB re 20 µPa²/Hz]")
+# plt.ylabel("PSD level [dB re 20 µPa²/Hz]")
+plt.ylabel("SPL level [dB]")
 
 plt.grid(True, which="both")
 plt.legend()
 
 plt.show()
+
 
 # find peaks --------------------------------------------------------------------------
 from scipy.signal import find_peaks
@@ -1254,12 +1379,12 @@ for name, data in spectra.items():
             (freq <= BPF_M+half_width)
         )
 
-        level = 10*np.log10(
-            np.trapezoid(
+        # level = #10*np.log10(
+        level =  np.trapezoid(
                 data["psd"][mask],
                 freq[mask]
             ) / pref**2
-        )
+         #)
 
         BPF_SPL.append(level)
 
